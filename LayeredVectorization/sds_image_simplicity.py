@@ -2,16 +2,22 @@ from typing import Tuple, Union, Optional, List
 import torch
 from torch.optim.sgd import SGD
 from diffusers import StableDiffusionPipeline, UNet2DConditionModel
+from diffusers import StableDiffusionXLImg2ImgPipeline
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
+from typing import Tuple, Union, Optional, List
+from diffusers import StableDiffusionImg2ImgPipeline
+
 
 T = torch.Tensor
 TN = Optional[T]
 TS = Union[Tuple[T, ...], List[T]]
 
 def load_512(image_path: str, left=0, right=0, top=0, bottom=0):
-    image = np.array(Image.open(image_path).resize((512,512)))[:, :, :3]    
+    image = Image.open(image_path).convert("RGB").resize((512, 512))
+    image = np.array(image)
+    
     h, w, c = image.shape
     left = min(left, w-1)
     right = min(right, w - left - 1)
@@ -120,7 +126,7 @@ class SDSLoss:
         self.unet, self.alphas, self.sigmas = init_pipe(device, dtype, pipe.unet, pipe.scheduler)
         self.prediction_type = pipe.scheduler.config.prediction_type
 
-def image_optimization(device, pipe: StableDiffusionPipeline, image: np.ndarray, text_target: str, num_iters: int = 200,):
+def image_optimization(device, pipe: Union[StableDiffusionPipeline, StableDiffusionImg2ImgPipeline], image: np.ndarray, text_target: str, num_iters: int = 200,):
     sds_loss = SDSLoss(device, pipe)
     image_source = torch.from_numpy(image).float().permute(2, 0, 1) / 127.5 - 1
     image_source = image_source.unsqueeze(0).to(device)
@@ -150,26 +156,39 @@ def image_optimization(device, pipe: StableDiffusionPipeline, image: np.ndarray,
             pbar.update(1)
     return simp_img_seq
 
-def sds_based_simplification(device, image: str, simp_img_seq_indexs: List[int], simp_img_seq_save_path: str, all_simp_img_seq_save_path: str = "-1"):
+def sds_based_simplification(
+    device,
+    image: str,
+    simp_img_seq_indexs: List[int],
+    simp_img_seq_save_path: str,
+    all_simp_img_seq_save_path: str = "-1",
+    pipe: Optional[Union[StableDiffusionPipeline, StableDiffusionImg2ImgPipeline]] = None,  
+):
+    """Simplify an image using SDS. Reuses pipeline if provided."""
     image = load_512(image)
     prompt = " "
-    # model_id  =  "/home/ubuntu/workspace/WZY/Projects/image_vectorization-1.0/models--runwayml--stable-diffusion-v1-5/snapshots/1d0c4ebf6ff58a5caecab40fa1406526bca4b5b9"
-    model_id = "runwayml/stable-diffusion-v1-5"
-    pipeline = StableDiffusionPipeline.from_pretrained(model_id).to(device)
+
+    # Load pipeline only if not provided
+    if pipe is None:
+        # pipe = build_sd_pipeline(model_id="runwayml/stable-diffusion-v1-5", device=device)
+        model_id = "runwayml/stable-diffusion-v1-5"
+        pipeline = StableDiffusionPipeline.from_pretrained(model_id).to(device)
+
     num_iters = simp_img_seq_indexs[0]
-    all_simp_img_seq = image_optimization(device, pipeline, image, prompt,num_iters)
+    all_simp_img_seq = image_optimization(device, pipe, image, prompt, num_iters)
 
     simp_img_seq = [image]
     image = Image.fromarray(image)
     image.save(f"{simp_img_seq_save_path}/0.png")
-    if simp_img_seq_save_path != "-1":
+    if all_simp_img_seq_save_path != "-1":
         image.save(f"{all_simp_img_seq_save_path}/0.png")
-    for i,simp_img in enumerate(all_simp_img_seq):
-        if i+1 in simp_img_seq_indexs:
+
+    for i, simp_img in enumerate(all_simp_img_seq):
+        if i + 1 in simp_img_seq_indexs:
             simp_img_seq.append(simp_img)
-            simp_img_=Image.fromarray(simp_img)
+            simp_img_ = Image.fromarray(simp_img)
             simp_img_.save(f"{simp_img_seq_save_path}/{i+1}.png")
-        if simp_img_seq_save_path != "-1":
-            simp_img_=Image.fromarray(simp_img)
+        if all_simp_img_seq_save_path != "-1":
+            simp_img_ = Image.fromarray(simp_img)
             simp_img_.save(f"{all_simp_img_seq_save_path}/{i+1}.png")
     return simp_img_seq

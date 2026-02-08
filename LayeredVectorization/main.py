@@ -3,11 +3,16 @@ import torch.nn.functional as F
 from PIL import Image
 import argparse
 from utils.img_process import *
-import os
+import glob, os
 from tqdm import tqdm
 from sds_image_simplicity import sds_based_simplification
 import pydiffvg
 import yaml
+from time import time
+from typing import Tuple, Union, Optional, List
+from diffusers import StableDiffusionPipeline
+import shutil
+
 
 def init_diffvg(device: torch.device,
                 use_gpu: bool = torch.cuda.is_available(),
@@ -196,30 +201,35 @@ def svg_optimize_img_visual(device, shapes, shape_groups,
             pbar.update(1)
     return shapes,shape_groups,count
 
-def layered_vectorization(args,device=None):
+def layered_vectorization(args, device=None, pipe: Optional[StableDiffusionPipeline] = None):
     simp_img_seq_save_path = f"./workdir/{args.file_save_name}/simplified_image_sequence"
-    os.makedirs(simp_img_seq_save_path,exist_ok=True)
+    os.makedirs(simp_img_seq_save_path, exist_ok=True)
     all_simp_img_seq_save_path = "-1"
     if args.is_save_all_simp_img_seq:
         all_simp_img_seq_save_path = f"./workdir/{args.file_save_name}/all_simplified_image_sequence"
-        os.makedirs(all_simp_img_seq_save_path,exist_ok=True)
-    masks_save_path=-1
+        os.makedirs(all_simp_img_seq_save_path, exist_ok=True)
+
+    masks_save_path = -1
     if args.is_save_masks:
         masks_save_path = f"./workdir/{args.file_save_name}/masks"
-        os.makedirs(masks_save_path,exist_ok=True)
+        os.makedirs(masks_save_path, exist_ok=True)
+
     struct_svgs_save_path = f"./workdir/{args.file_save_name}/struct_svgs"
-    os.makedirs(struct_svgs_save_path,exist_ok=True)
+    os.makedirs(struct_svgs_save_path, exist_ok=True)
     visual_svgs_save_path = f"./workdir/{args.file_save_name}/struct&visual_svgs"
-    os.makedirs(visual_svgs_save_path,exist_ok=True)
+    os.makedirs(visual_svgs_save_path, exist_ok=True)
     layerd_struct_save_path = f"./workdir/{args.file_save_name}/layerd_struct"
-    os.makedirs(layerd_struct_save_path,exist_ok=True)
+    os.makedirs(layerd_struct_save_path, exist_ok=True)
 
     print("SDS-based Simplification...")
-    simp_img_seq = sds_based_simplification(device,
-                                            args.target_image,
-                                            args.simp_img_seq_indexs,
-                                            simp_img_seq_save_path,
-                                            all_simp_img_seq_save_path)
+    simp_img_seq = sds_based_simplification(
+        device,
+        args.target_image,
+        args.simp_img_seq_indexs,
+        simp_img_seq_save_path,
+        all_simp_img_seq_save_path,
+        pipe=pipe,   # 👈 Reuse pipeline here
+    )
     target_img = simp_img_seq[0]
     img_height, img_width = target_img.shape[:2]
 
@@ -312,31 +322,70 @@ def load_config(file_path,args):
 
 
 if __name__ == "__main__":
-    # parser = argparse.ArgumentParser(description="layered_image_vectorization",)
-    # parser.add_argument("-c", "--config", type=str, default="./config/base_config.yaml",help="YAML/YML file for configuration.")
-    # parser.add_argument("-timg", "--target_image", default="./target_imgs/Snipaste_2024-11-19_16-31-12.png", type=str)
-    # parser.add_argument("-fsn", "--file_save_name", type=str, default="man",help="Files save name.")
+    parser = argparse.ArgumentParser(description="layered_image_vectorization")
+    parser.add_argument("-c", "--config", type=str, default="./config/base_config.yaml",
+                        help="YAML/YML file for configuration.")
+    parser.add_argument("-timg", "--target_image", type=str,
+                        default="./target_imgs/Snipaste_2024-11-19_16-31-12.png",
+                        help="Path to target image or directory of images.")
+    parser.add_argument("-fsn", "--file_save_name", type=str, default="man",
+                        help="Files save name (used if input_type=image).")
+    parser.add_argument("--input_type", choices=["image", "dir"], default="image",
+                        help="Whether --target_image is a single image file or a directory.")
+    parser.add_argument("--split_index", type=int, default=0,
+                        help="Index of split for parallel jobs (0-based).")
+    parser.add_argument("--n_split", type=int, default=1,
+                        help="Total number of splits (parallel jobs).")
+    args = parser.parse_args()
+    args = load_config(args.config, args)
 
-    # args = parser.parse_args()
-    # args = load_config(args.config,args)
-    # device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
-    # init_diffvg(device=device)
-    # layered_vectorization(args,device)
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    model_id = "runwayml/stable-diffusion-v1-5"
+    pipe = StableDiffusionPipeline.from_pretrained(model_id).to(device)
 
-    import glob
-    # 定义文件夹路径
-    folder_path = '/home/ubuntu/workspace/WZY/Projects/image_vectorization-1.3/target_imgs/002'
-    # 获取所有 PNG 文件的路径
-    png_files = glob.glob(f'{folder_path}/*.png')
-
-    for i,file_path in enumerate(png_files):
-        parser = argparse.ArgumentParser(description="layered_image_vectorization",)
-        parser.add_argument("-c", "--config", type=str, default="./config/base_config.yaml",help="YAML/YML file for configuration.")
-        parser.add_argument("-timg", "--target_image", default=file_path, type=str)
-        parser.add_argument("-fsn", "--file_save_name", type=str, default=f"004/{file_path.split('/')[-1]}",help="Files save name.")
-
-        args = parser.parse_args()
-        args = load_config(args.config,args)
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    # -------- Single image --------
+    if args.input_type == "image":
+        t = time()
+        layered_vectorization(args, device, pipe=pipe)
         init_diffvg(device=device)
-        layered_vectorization(args,device)
+        print(f"Elapsed time: {time() - t:.2f} sec")
+
+    # -------- Directory of images --------
+    elif args.input_type == "dir":
+        folder_path = args.target_image
+        png_files = glob.glob(os.path.join(folder_path, "*.png")) + \
+                    glob.glob(os.path.join(folder_path, "*.jpg"))
+        png_files.sort()
+        total_files = len(png_files)
+
+        # Split work among nodes (before filtering)
+        files_per_split = (total_files + args.n_split - 1) // args.n_split
+        start_idx = args.split_index * files_per_split
+        end_idx = min((args.split_index + 1) * files_per_split, total_files)
+        assigned_files = png_files[start_idx:end_idx]
+
+        # 🔑 filter inside this split
+        filtered_files = []
+        for file_path in assigned_files:
+            save_name = os.path.splitext(os.path.basename(file_path))[0]
+            exp_dir = os.path.join("workdir", "batch", save_name)
+            final_svg = os.path.join(exp_dir, "final.svg")
+            if not os.path.exists(final_svg):
+                if os.path.exists(exp_dir):  # cleanup incomplete
+                    print(f'Remove {exp_dir} for reinitialization')
+                    shutil.rmtree(exp_dir)
+                filtered_files.append(file_path)
+
+        print(f"[Split {args.split_index}/{args.n_split}] "
+            f"Assigned {len(assigned_files)}, processing {len(filtered_files)} (after filtering)")
+
+        for idx, file_path in enumerate(filtered_files, start=1):
+            save_name = os.path.splitext(os.path.basename(file_path))[0]
+            sub_args = argparse.Namespace(**vars(args))
+            sub_args.target_image = file_path
+            sub_args.file_save_name = f"batch/{save_name}"
+
+            t = time()
+            init_diffvg(device=device)
+            layered_vectorization(sub_args, device, pipe=pipe)
+            print(f"({idx}/{len(filtered_files)}) {file_path} done in {time() - t:.2f} sec")
