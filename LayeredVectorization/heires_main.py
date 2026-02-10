@@ -200,7 +200,7 @@ def build_local_support_mask(refined_rgb: np.ndarray, base_rgb: np.ndarray, save
     diff_norm = diff_mag / (diff_mag.max() + 1e-6)
     diff_vis = (diff_norm * 255).astype(np.uint8)
 
-    mask = (diff_norm > 0.1).astype(np.uint8) * 255
+    mask = (diff_norm > 0.2).astype(np.uint8) * 255
     kernel_big = np.ones((11, 11), np.uint8)
     mask = cv2.dilate(mask, kernel_big, iterations=1)
 
@@ -257,7 +257,8 @@ def post_local_refine(
     base_w, base_h = base_img.size
 
     pseudo_masks = []  # used by optional final merge
-    is_opt_list = []
+    # is_opt_list = []
+    is_opt_list = [False] * len(shapes)
     struct_path_num = len(shapes)
     zoom = LocalZoomHelper(im_size=canvas_w)
 
@@ -317,6 +318,7 @@ def post_local_refine(
     # ----------------------------
     # Local refine loop
     # ----------------------------
+    count = 0
     for bi, bb in enumerate(bboxes):
         x0, y0, x1, y1 = bb
         scaled_bb = x0/sx_canvas, y0/sy_canvas, x1/sx_canvas, y1/sy_canvas
@@ -352,15 +354,15 @@ def post_local_refine(
         base_crop_np = np.clip(np.array(base_crop_pix), 0, 255).astype(np.uint8)
 
         support_mask = build_local_support_mask(refined_np, base_crop_np, save_dir=bbox_dir)
+        # support_mask = np.ones_like(refined_np[:, :, 0], dtype=np.uint8) * 255
         pseudo_masks_local = [support_mask]
 
         # zoom svg into bbox -> local canvas
         zoom.zoomin(bb, shapes, scale_width=True)
 
         # add paths + optimize in local canvas
-        count = 0
         for it in range(int(args.local_iters)):
-            remaining = 128
+            remaining = 64
             shapes, shape_groups, pseudo_masks_local, is_opt_list, struct_path_num = add_visual_paths(
                 shapes, shape_groups, device,
                 struct_path_num,
@@ -370,11 +372,9 @@ def post_local_refine(
                 epsilon=args.approxpolydp_epsilon,
                 N=remaining,
             )
-
-            print("[Add] shapes:", len(shapes), "is_opt_list:", len(is_opt_list), "struct_path_num:", struct_path_num)
-
-            if bool(_get(args, "sdxl_only", True)):
-                continue
+            print(f"[Add] shapes={len(shapes)} opt_true={int(sum(is_opt_list))} struct_path_num={struct_path_num}")
+            # num_grad = sum(int(getattr(p.points, "requires_grad", False)) for p in shapes if hasattr(p, "points"))
+            # print(f"[opt] grad_paths={num_grad}/{len(shapes)} sum(is_opt_list)={int(sum(is_opt_list))}")
 
             if struct_path_num == -1:
                 print(f"[Local bbox {bi}] no new paths")
@@ -383,9 +383,9 @@ def post_local_refine(
             save_dir = f"./workdir/{args.file_save_name}/post_local_bbox_{bi}"
             os.makedirs(save_dir, exist_ok=True)
 
-            shapes, shape_groups, _ = svg_optimize_img_visual(
+            shapes, shape_groups, count = svg_optimize_img_visual(
                 device, shapes, shape_groups,
-                refined_np,  # optimize to refined crop in zoom canvas
+                refined_np, 
                 file_save_path=save_dir,
                 is_opt_list=is_opt_list,
                 train_conf=args.train,
@@ -396,7 +396,7 @@ def post_local_refine(
             )
             
             shapes,shape_groups = remove_lowquality_paths(
-                shapes, shape_groups, device, img_width, img_height, 
+                shapes, shape_groups, device, canvas_w, canvas_h, 
                 visual_difference_threshold=args.paths_remove_visual_threshold,
                 struct_path_num=struct_path_num)
 
