@@ -393,17 +393,17 @@ def post_local_refine(
             save_dir = f"./workdir/{args.file_save_name}/post_local_bbox_{bi}"
             os.makedirs(save_dir, exist_ok=True)
 
-            # shapes, shape_groups, _ = svg_optimize_img_visual(
-            #     device, shapes, shape_groups,
-            #     refined_np,  # optimize to refined crop in zoom canvas
-            #     file_save_path=save_dir,
-            #     is_opt_list=is_opt_list,
-            #     train_conf=args.train,
-            #     base_lr_conf=args.base_lr,
-            #     count=0,
-            #     struct_path_num=struct_path_num,
-            #     is_path_merging_phase=False,
-            # )
+            shapes, shape_groups, _ = svg_optimize_img_visual(
+                device, shapes, shape_groups,
+                refined_np,  # optimize to refined crop in zoom canvas
+                file_save_path=save_dir,
+                is_opt_list=is_opt_list,
+                train_conf=args.train,
+                base_lr_conf=args.base_lr,
+                count=0,
+                struct_path_num=struct_path_num,
+                is_path_merging_phase=False,
+            )
 
         # zoom back out
         zoom.zoomout(shapes)
