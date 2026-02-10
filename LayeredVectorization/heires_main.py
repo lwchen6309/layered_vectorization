@@ -193,7 +193,7 @@ def sdxl_refine_fp16(pipe_sdxl, image, prompt, negative_prompt, steps, guidance_
 def build_local_support_mask(refined_rgb: np.ndarray, base_rgb: np.ndarray, save_dir=None):
     """
     Build local fitting support mask from SDXL refined vs original crop.
-    Both inputs are RGB uint8 arrays in the SAME resolution (e.g. args.img_size x args.img_size).
+    Both inputs are RGB uint8 arrays in the SAME resolution (e.g. canvas_w x canvas_w).
     """
     ref_lab  = cv2.cvtColor(refined_rgb, cv2.COLOR_RGB2LAB)
     base_lab = cv2.cvtColor(base_rgb,    cv2.COLOR_RGB2LAB)
@@ -206,15 +206,9 @@ def build_local_support_mask(refined_rgb: np.ndarray, base_rgb: np.ndarray, save
     diff_norm = diff_mag / (diff_mag.max() + 1e-6)
     diff_vis = (diff_norm * 255).astype(np.uint8)
 
-    mask = (diff_norm > 0.18).astype(np.uint8) * 255
-
-    kernel_small = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_small)
-
+    mask = (diff_norm > 0.1).astype(np.uint8) * 255
     kernel_big = np.ones((31, 31), np.uint8)
-    mask = cv2.dilate(mask, kernel_big, iterations=2)
-
-    mask = cv2.GaussianBlur(mask, (21, 21), 0)
+    mask = cv2.dilate(mask, kernel_big, iterations=1)
 
     if save_dir is not None:
         Image.fromarray(diff_vis).save(os.path.join(save_dir, "diff_map.png"))
@@ -237,10 +231,10 @@ def post_local_refine(
     """
     Key revision:
       - SAM auto-bboxes are in *base_img pixel coordinates*.
-      - We DO NOT rescale bboxes with args.img_size anymore.
+      - We DO NOT rescale bboxes with canvas_w anymore.
       - We convert pixel-bboxes -> SVG-canvas coords before zoomin.
-      - add_visual_paths / svg_optimize_img_visual operate in zoom canvas of size args.img_size,
-        so refined/base crops and support masks are resized to (args.img_size, args.img_size).
+      - add_visual_paths / svg_optimize_img_visual operate in zoom canvas of size canvas_w,
+        so refined/base crops and support masks are resized to (canvas_w, canvas_w).
     """
 
     # ----------------------------
@@ -273,8 +267,8 @@ def post_local_refine(
     struct_path_num = len(shapes)
 
     # IMPORTANT: zoom canvas size must match what your original add_visual_paths expects
-    # (typically args.img_size used by LayerVec). If not provided, fall back to canvas_w (assuming square).
-    # args.img_size = int(getattr(args, "img_size", canvas_w))
+    # (typically canvas_w used by LayerVec). If not provided, fall back to canvas_w (assuming square).
+    # canvas_w = int(getattr(args, "img_size", canvas_w))
     zoom = LocalZoomHelper(im_size=canvas_w)
 
     # scale factors: base image pixel -> SVG canvas coords
@@ -335,10 +329,10 @@ def post_local_refine(
     # ----------------------------
     for bi, bb in enumerate(bboxes):
         # bb is in base image pixel coords (x0,y0,x1,y1)
-        crop_sdxl, (x0, y0, x1, y1) = crop_resize_pil(
+        crop_sdxl = crop_resize_pil(
             base_img, bb,
             out_size=args.local_size,
-            ref_size=args.img_size,
+            ref_size=canvas_w,
             is_mask=False,
         )
 
@@ -361,9 +355,9 @@ def post_local_refine(
         refined_sdxl.save(os.path.join(bbox_dir, "refined_img.png"))
         print(f"[SDXL] Saved bbox {bi} results → {bbox_dir}")
 
-        # Prepare images for vector stage at args.img_size (the zoom canvas)
-        refined_vec = refined_sdxl.resize((args.img_size, args.img_size), Image.BICUBIC)
-        base_crop_pix = base_img.crop((x0, y0, x1, y1)).resize((args.img_size, args.img_size), Image.BICUBIC)
+        # Prepare images for vector stage at canvas_w (the zoom canvas)
+        refined_vec = refined_sdxl.resize((canvas_w, canvas_w), Image.BICUBIC)
+        base_crop_pix = base_img.crop((x0, y0, x1, y1)).resize((canvas_w, canvas_w), Image.BICUBIC)
 
         refined_np = np.clip(np.array(refined_vec), 0, 255).astype(np.uint8)
         base_crop_np = np.clip(np.array(base_crop_pix), 0, 255).astype(np.uint8)
@@ -371,16 +365,8 @@ def post_local_refine(
         support_mask = build_local_support_mask(refined_np, base_crop_np, save_dir=bbox_dir)
         pseudo_masks_local = [support_mask]
 
-        # Convert pixel bbox -> SVG canvas bbox (so it matches shapes coords)
-        bb_canvas = (
-            float(x0) * sx_canvas,
-            float(y0) * sy_canvas,
-            float(x1) * sx_canvas,
-            float(y1) * sy_canvas,
-        )
-
         # zoom svg into bbox -> local canvas
-        zoom.zoomin(bb_canvas, shapes, scale_width=True)
+        zoom.zoomin(bb, shapes, scale_width=True)
 
         # add paths + optimize in local canvas
         for it in range(int(args.local_iters)):
@@ -407,17 +393,17 @@ def post_local_refine(
             save_dir = f"./workdir/{args.file_save_name}/post_local_bbox_{bi}"
             os.makedirs(save_dir, exist_ok=True)
 
-            shapes, shape_groups, _ = svg_optimize_img_visual(
-                device, shapes, shape_groups,
-                refined_np,  # optimize to refined crop in zoom canvas
-                file_save_path=save_dir,
-                is_opt_list=is_opt_list,
-                train_conf=args.train,
-                base_lr_conf=args.base_lr,
-                count=0,
-                struct_path_num=struct_path_num,
-                is_path_merging_phase=False,
-            )
+            # shapes, shape_groups, _ = svg_optimize_img_visual(
+            #     device, shapes, shape_groups,
+            #     refined_np,  # optimize to refined crop in zoom canvas
+            #     file_save_path=save_dir,
+            #     is_opt_list=is_opt_list,
+            #     train_conf=args.train,
+            #     base_lr_conf=args.base_lr,
+            #     count=0,
+            #     struct_path_num=struct_path_num,
+            #     is_path_merging_phase=False,
+            # )
 
         # zoom back out
         zoom.zoomout(shapes)
