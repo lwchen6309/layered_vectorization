@@ -145,7 +145,7 @@ class LocalZoomHelper:
 # ---------------------------------------------------------------------
 # 3) Crop helpers
 # ---------------------------------------------------------------------
-def crop_resize_pil(img, bbox, *, out_size: int, ref_size: float = None, is_mask: bool = False):
+def crop_resize_pil(img, bbox, *, out_size: int, is_mask: bool = False):
     """
     Crop + resize in PIL, returning (crop_rs, (x0,y0,x1,y1)).
 
@@ -157,16 +157,10 @@ def crop_resize_pil(img, bbox, *, out_size: int, ref_size: float = None, is_mask
     W, H = pil.size
     x0, y0, x1, y1 = map(float, bbox)
 
-    if ref_size is not None:
-        sx = W / float(ref_size)
-        sy = H / float(ref_size)
-        x0 *= sx; x1 *= sx
-        y0 *= sy; y1 *= sy
-
     x0 = int(max(0, min(W - 1, round(x0))))
     y0 = int(max(0, min(H - 1, round(y0))))
-    x1 = int(max(1, min(W,     round(x1))))
-    y1 = int(max(1, min(H,     round(y1))))
+    x1 = int(max(1, min(W, round(x1))))
+    y1 = int(max(1, min(H, round(y1))))
 
     if x1 <= x0: x1 = min(W, x0 + 1)
     if y1 <= y0: y1 = min(H, y0 + 1)
@@ -174,7 +168,7 @@ def crop_resize_pil(img, bbox, *, out_size: int, ref_size: float = None, is_mask
     crop = pil.crop((x0, y0, x1, y1))
     resample = Image.NEAREST if is_mask else Image.BICUBIC
     crop_rs = crop.resize((out_size, out_size), resample=resample)
-    return crop_rs, (x0, y0, x1, y1)
+    return crop_rs
 
 
 @torch.inference_mode()
@@ -207,7 +201,7 @@ def build_local_support_mask(refined_rgb: np.ndarray, base_rgb: np.ndarray, save
     diff_vis = (diff_norm * 255).astype(np.uint8)
 
     mask = (diff_norm > 0.1).astype(np.uint8) * 255
-    kernel_big = np.ones((31, 31), np.uint8)
+    kernel_big = np.ones((11, 11), np.uint8)
     mask = cv2.dilate(mask, kernel_big, iterations=1)
 
     if save_dir is not None:
@@ -265,10 +259,6 @@ def post_local_refine(
     pseudo_masks = []  # used by optional final merge
     is_opt_list = []
     struct_path_num = len(shapes)
-
-    # IMPORTANT: zoom canvas size must match what your original add_visual_paths expects
-    # (typically canvas_w used by LayerVec). If not provided, fall back to canvas_w (assuming square).
-    # canvas_w = int(getattr(args, "img_size", canvas_w))
     zoom = LocalZoomHelper(im_size=canvas_w)
 
     # scale factors: base image pixel -> SVG canvas coords
@@ -278,46 +268,46 @@ def post_local_refine(
     # ----------------------------
     # SAM-only AutoBBox (reads args.sam.*)
     # ----------------------------
-    if bool(_get(args, "auto_bbox", False)):
-        sam_ckpt = _get_path(args, "sam.sam_checkpoint", None) or _get(args, "sam_ckpt", None)
-        if sam_ckpt is None:
-            raise ValueError(
-                "auto_bbox=True but SAM checkpoint not found. "
-                "Provide args.sam.sam_checkpoint (preferred) or args.sam_ckpt."
-            )
+    # if bool(_get(args, "auto_bbox", False)):
+    #     sam_ckpt = _get_path(args, "sam.sam_checkpoint", None) or _get(args, "sam_ckpt", None)
+    #     if sam_ckpt is None:
+    #         raise ValueError(
+    #             "auto_bbox=True but SAM checkpoint not found. "
+    #             "Provide args.sam.sam_checkpoint (preferred) or args.sam_ckpt."
+    #         )
 
-        gen = init_sam_mask_generator(
-            device=device,
-            ckpt_path=sam_ckpt,
-            model_type=str(_get_path(args, "sam.model_type", "vit_h")),
-            points_per_side=int(_get_path(args, "sam.points_per_side", 32)),
-            pred_iou_thresh=float(_get_path(args, "sam.pred_iou_thresh", 0.88)),
-            stability_score_thresh=float(_get_path(args, "sam.stability_score_thresh", 0.92)),
-            crop_n_layers=int(_get_path(args, "sam.crop_n_layers", 1)),
-            crop_n_points_downscale_factor=int(_get_path(args, "sam.crop_n_points_downscale_factor", 2)),
-            min_mask_region_area=int(_get_path(args, "sam.min_mask_region_area", 200)),
-        )
+    #     gen = init_sam_mask_generator(
+    #         device=device,
+    #         ckpt_path=sam_ckpt,
+    #         model_type=str(_get_path(args, "sam.model_type", "vit_h")),
+    #         points_per_side=int(_get_path(args, "sam.points_per_side", 32)),
+    #         pred_iou_thresh=float(_get_path(args, "sam.pred_iou_thresh", 0.88)),
+    #         stability_score_thresh=float(_get_path(args, "sam.stability_score_thresh", 0.92)),
+    #         crop_n_layers=int(_get_path(args, "sam.crop_n_layers", 1)),
+    #         crop_n_points_downscale_factor=int(_get_path(args, "sam.crop_n_points_downscale_factor", 2)),
+    #         min_mask_region_area=int(_get_path(args, "sam.min_mask_region_area", 200)),
+    #     )
 
-        # NOTE: ref_size is only for *internal filtering/scoring* in your detect helper.
-        # Using the real image min side is the least confusing choice.
-        cfg = SamOnlyConfig(
-            ref_size=int(min(base_w, base_h)),
-            topk=int(_get(args, "bbox_topk", 8)),
-            square=True,
-            enlarge=float(_get(args, "bbox_enlarge", 1.05)),
-            min_area_frac=float(_get(args, "bbox_min_area_frac", 0.002)),
-            max_area_frac=float(_get(args, "bbox_max_area_frac", 0.20)),
-            nms_iou=float(_get_path(args, "sam.box_nms_thresh", _get(args, "bbox_nms_iou", 0.65))),
-        )
+    #     # NOTE: ref_size is only for *internal filtering/scoring* in your detect helper.
+    #     # Using the real image min side is the least confusing choice.
+    #     cfg = SamOnlyConfig(
+    #         ref_size=int(min(base_w, base_h)),
+    #         topk=int(_get(args, "bbox_topk", 8)),
+    #         square=True,
+    #         enlarge=float(_get(args, "bbox_enlarge", 1.05)),
+    #         min_area_frac=float(_get(args, "bbox_min_area_frac", 0.002)),
+    #         max_area_frac=float(_get(args, "bbox_max_area_frac", 0.20)),
+    #         nms_iou=float(_get_path(args, "sam.box_nms_thresh", _get(args, "bbox_nms_iou", 0.65))),
+    #     )
 
-        debug_dir = f"./workdir/{args.file_save_name}/sam_bbox_debug"
-        args.bboxes = detect_bboxes_sam_only(
-            mask_generator=gen,
-            base_img_pil=base_img,
-            cfg=cfg,
-            debug_dir=debug_dir,
-        )
-        print("[SAM-only AutoBBox] bboxes (base_img pixel coords):", args.bboxes)
+    #     debug_dir = f"./workdir/{args.file_save_name}/sam_bbox_debug"
+    #     args.bboxes = detect_bboxes_sam_only(
+    #         mask_generator=gen,
+    #         base_img_pil=base_img,
+    #         cfg=cfg,
+    #         debug_dir=debug_dir,
+    #     )
+    #     print("[SAM-only AutoBBox] bboxes (base_img pixel coords):", args.bboxes)
 
     # sanity: require bboxes
     bboxes = _get(args, "bboxes", None)
@@ -328,12 +318,11 @@ def post_local_refine(
     # Local refine loop
     # ----------------------------
     for bi, bb in enumerate(bboxes):
-        # bb is in base image pixel coords (x0,y0,x1,y1)
-        crop_sdxl, (x0, y0, x1, y1) = crop_resize_pil(
-            base_img, bb,
+        x0, y0, x1, y1 = bb
+        scaled_bb = x0/sx_canvas, y0/sy_canvas, x1/sx_canvas, y1/sy_canvas
+        crop_sdxl = crop_resize_pil(
+            base_img, scaled_bb,
             out_size=args.local_size,
-            ref_size=canvas_w,
-            is_mask=False,
         )
 
         # SAVE DEBUG IMAGES
@@ -369,6 +358,7 @@ def post_local_refine(
         zoom.zoomin(bb, shapes, scale_width=True)
 
         # add paths + optimize in local canvas
+        count = 0
         for it in range(int(args.local_iters)):
             remaining = 128
             shapes, shape_groups, pseudo_masks_local, is_opt_list, struct_path_num = add_visual_paths(
@@ -400,10 +390,15 @@ def post_local_refine(
                 is_opt_list=is_opt_list,
                 train_conf=args.train,
                 base_lr_conf=args.base_lr,
-                count=0,
+                count=count,
                 struct_path_num=struct_path_num,
                 is_path_merging_phase=False,
             )
+            
+            shapes,shape_groups = remove_lowquality_paths(
+                shapes, shape_groups, device, img_width, img_height, 
+                visual_difference_threshold=args.paths_remove_visual_threshold,
+                struct_path_num=struct_path_num)
 
         # zoom back out
         zoom.zoomout(shapes)
