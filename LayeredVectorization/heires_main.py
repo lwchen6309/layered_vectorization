@@ -329,7 +329,7 @@ def post_local_refine(
     # ----------------------------
     for bi, bb in enumerate(bboxes):
         # bb is in base image pixel coords (x0,y0,x1,y1)
-        crop_sdxl = crop_resize_pil(
+        crop_sdxl, (x0, y0, x1, y1) = crop_resize_pil(
             base_img, bb,
             out_size=args.local_size,
             ref_size=canvas_w,
