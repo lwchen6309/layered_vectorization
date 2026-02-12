@@ -257,8 +257,8 @@ def post_local_refine(
     base_w, base_h = base_img.size
 
     pseudo_masks = []  # used by optional final merge
-    # is_opt_list = []
-    is_opt_list = [False] * len(shapes)
+    is_opt_list = []
+    # is_opt_list = [False] * len(shapes)
     struct_path_num = len(shapes)
     zoom = LocalZoomHelper(im_size=canvas_w)
 
@@ -362,6 +362,21 @@ def post_local_refine(
 
         # add paths + optimize in local canvas
         for it in range(int(args.local_iters)):
+            save_dir = f"./workdir/{args.file_save_name}/post_local_bbox_{bi}"
+            os.makedirs(save_dir, exist_ok=True)
+            
+            shapes, shape_groups, count = svg_optimize_img_visual(
+                device, shapes, shape_groups,
+                refined_np, 
+                file_save_path=save_dir,
+                is_opt_list=is_opt_list,
+                train_conf=args.train,
+                base_lr_conf=args.base_lr,
+                count=count,
+                struct_path_num=struct_path_num,
+                is_path_merging_phase=False,
+            )
+
             remaining = 64
             shapes, shape_groups, pseudo_masks_local, is_opt_list, struct_path_num = add_visual_paths(
                 shapes, shape_groups, device,
@@ -379,9 +394,6 @@ def post_local_refine(
             if struct_path_num == -1:
                 print(f"[Local bbox {bi}] no new paths")
                 break
-
-            save_dir = f"./workdir/{args.file_save_name}/post_local_bbox_{bi}"
-            os.makedirs(save_dir, exist_ok=True)
 
             shapes, shape_groups, count = svg_optimize_img_visual(
                 device, shapes, shape_groups,
