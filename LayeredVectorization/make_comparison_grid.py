@@ -2,8 +2,11 @@
 import argparse
 from pathlib import Path
 import glob
+from io import BytesIO
+
 import matplotlib.pyplot as plt
 from PIL import Image
+import cairosvg
 
 
 def find_first(patterns):
@@ -17,6 +20,9 @@ def find_first(patterns):
 def open_img(p):
     if p and p.exists():
         try:
+            if p.suffix.lower() == ".svg":
+                png_bytes = cairosvg.svg2png(url=str(p))
+                return Image.open(BytesIO(png_bytes)).convert("RGB")
             return Image.open(p).convert("RGB")
         except Exception:
             return None
