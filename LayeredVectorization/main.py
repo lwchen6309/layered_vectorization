@@ -2,7 +2,7 @@ import os
 import glob
 import shutil
 import argparse
-from time import time
+import time
 from typing import Optional, List
 
 import yaml
@@ -519,10 +519,10 @@ if __name__ == "__main__":
     pipe = StableDiffusionPipeline.from_pretrained(model_id).to(device)
 
     if args.input_type == "image":
-        t = time()
+        t = time.time()
         init_diffvg(device=device)
         layered_vectorization(args, device, pipe=pipe)
-        print(f"Elapsed time: {time() - t:.2f} sec")
+        print(f"Elapsed time: {time.time() - t:.2f} sec")
 
     elif args.input_type == "dir":
         folder_path = args.target_image
