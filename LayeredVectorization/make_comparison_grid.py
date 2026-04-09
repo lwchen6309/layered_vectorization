@@ -42,7 +42,7 @@ def main():
             "SDXL": find_first([stim / "sd21b_cn1_w1e1_pww1_segline" / "**" / "init_image_sdxl_refined.png"]),
             "SVGD": find_first([stim / "sd21b" / "**" / "all_particles.png"]),
             "SVGComp": find_first([stim / "sd21b_cn1_w1e1_pww1_segline" / "**" / "all_particles.png"]),
-            "SVGComp-ReVec": find_first([stim / "sd21b_cn1_w1e1_pww1_segline" / "**" / "layervec" / "*.png"]),
+            "SVGComp-ReVec": find_first([stim / "sd21b_cn1_w1e1_pww1_segline" / "**" / "layervec" / "final.svg"]),
         }
         rows.append(row)
 
