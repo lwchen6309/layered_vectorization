@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 import argparse
 import re
+from io import BytesIO
 from pathlib import Path
 
+import cairosvg
 import torch
 import yaml
+from PIL import Image
 from diffusers import AutoPipelineForImage2Image
-from diffusers.utils import load_image
 
 
 def parse_args():
@@ -33,7 +35,6 @@ def extract_prompt_from_overrides_yaml(path: Path) -> str:
         for item in data:
             if not isinstance(item, str):
                 continue
-            # exact key parse first
             if item.startswith("prompt="):
                 value = item[len("prompt="):].strip()
                 if len(value) >= 2 and (
@@ -43,7 +44,6 @@ def extract_prompt_from_overrides_yaml(path: Path) -> str:
                     value = value[1:-1]
                 return value
 
-    # fallback regex on raw file
     raw = path.read_text(encoding="utf-8")
     m = re.search(r"(?m)^-\s+prompt=(.+)$", raw)
     if m:
@@ -65,6 +65,57 @@ def do_extract_prompt(args):
     print(prompt, end="")
 
 
+def open_image_any_format(image_path: str) -> Image.Image:
+    """
+    Open an image from SVG or raster formats while preserving transparency.
+    Returns a PIL image.
+    """
+    path = Path(image_path)
+
+    if not path.exists():
+        raise FileNotFoundError(f"Input file not found: {path}")
+
+    if path.suffix.lower() == ".svg":
+        png_bytes = cairosvg.svg2png(url=str(path))
+        image = Image.open(BytesIO(png_bytes))
+    else:
+        image = Image.open(path)
+
+    return image
+
+
+def load_image_with_white_bg(image_path: str) -> Image.Image:
+    """
+    Load an image, preserve transparency if present, composite it onto a
+    white background, and return an RGB image.
+    """
+    image = open_image_any_format(image_path)
+
+    if image.mode in ("RGBA", "LA"):
+        rgba = image.convert("RGBA")
+        alpha = rgba.getchannel("A")
+
+        # Composite only when real transparency exists
+        if alpha.getextrema()[0] < 255:
+            white_bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+            composited = Image.alpha_composite(white_bg, rgba)
+            return composited.convert("RGB")
+        return rgba.convert("RGB")
+
+    if image.mode == "P":
+        # Palette images may contain transparency information
+        if "transparency" in image.info:
+            rgba = image.convert("RGBA")
+            alpha = rgba.getchannel("A")
+            if alpha.getextrema()[0] < 255:
+                white_bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+                composited = Image.alpha_composite(white_bg, rgba)
+                return composited.convert("RGB")
+        return image.convert("RGB")
+
+    return image.convert("RGB")
+
+
 def do_refine(args):
     if not args.input or not args.output or not args.prompt:
         raise ValueError("--input, --output, and --prompt are required for refinement")
@@ -73,7 +124,12 @@ def do_refine(args):
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    image = load_image(str(input_path)).convert("RGB")
+    # Load input image, support SVG, and convert to white-background RGB
+    image = load_image_with_white_bg(str(input_path))
+
+    # Save a debug JPEG to verify the white background before diffusion
+    debug_input_path = output_path.parent / f"{output_path.stem}_input_white.jpg"
+    image.save(debug_input_path, quality=95)
 
     use_cuda = args.device == "cuda" and torch.cuda.is_available()
     dtype = torch.float16 if use_cuda else torch.float32
@@ -104,6 +160,7 @@ def do_refine(args):
 
     result.save(str(output_path))
     print(f"Saved: {output_path}")
+    print(f"Saved debug input: {debug_input_path}")
 
 
 def main():

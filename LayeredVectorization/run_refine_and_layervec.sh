@@ -58,7 +58,8 @@ for f in $TARGET_GLOB; do
     # ------------------------------------------------------------
     # refine init_image (用原 prompt)
     # ------------------------------------------------------------
-    init_img="${base_dir}/init_image.png"
+    # init_img="${base_dir}/init_image.png"
+    init_img="${base_dir}/VPSD_svg_logs/svg_iter0_p0.svg"
     refined_init="${base_dir}/init_image_sdxl_refined.png"
 
     if [ -f "$init_img" ]; then
