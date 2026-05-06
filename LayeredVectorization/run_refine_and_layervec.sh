@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-TARGET_GLOB="/data/leuven/362/vsc36208/CompSVG/logs/picd/*/sd21b_cn1_w1e1_pww1_segline/SVGDreamer*/sd42-sive-iconography-P1024/all_particles.png"
+TARGET_NAME="${1:-picd}"
+TARGET_GLOB="/data/leuven/362/vsc36208/CompSVG/logs/${TARGET_NAME}/*/sd21b_cn1_w1e1_pww1_segline/SVGDreamer*/sd42-sive-iconography-P1024/all_particles.png"
+
+echo "[Info] TARGET_NAME=${TARGET_NAME}"
+echo "[Info] TARGET_GLOB=${TARGET_GLOB}"
 
 CONFIG="config/256_config.yaml"
 MAIN_PY="main.py"
@@ -13,7 +17,16 @@ STEPS="30"
 
 shopt -s nullglob
 
-for f in $TARGET_GLOB; do
+matched_files=( $TARGET_GLOB )
+if [ ${#matched_files[@]} -eq 0 ]; then
+    echo "[Warn] No files matched for TARGET_NAME=${TARGET_NAME}"
+    echo "[Warn] TARGET_GLOB=${TARGET_GLOB}"
+    exit 0
+fi
+
+echo "[Info] Matched ${#matched_files[@]} file(s)"
+
+for f in "${matched_files[@]}"; do
     base_dir="$(dirname "$f")"
 
     echo "============================================================"
