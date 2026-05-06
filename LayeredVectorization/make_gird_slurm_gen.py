@@ -14,7 +14,7 @@ RESUME_TARGETS = [f"picd_{i:03d}" for i in range(7, 51)]
 
 SLURM_TEMPLATE = """#!/bin/bash -l
 #SBATCH --job-name=LayerVec_{target}
-#SBATCH --time=48:00:00
+#SBATCH --time=04:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=8
 #SBATCH --mem-per-cpu=4g
