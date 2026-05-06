@@ -1,0 +1,6 @@
+LayeredVectorization/__pycache__/
+LayeredVectorization/*.py[cod]
+LayeredVectorization/slurm_picd/
+LayeredVectorization/submit_all.sh
+LayeredVectorization/submit_7_to_50.sh
+LayeredVectorization/logs/
