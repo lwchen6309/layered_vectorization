@@ -79,16 +79,18 @@ for f in $TARGET_GLOB; do
         echo "[Skip] init_image not found: $init_img"
     fi
 
-    # ------------------------------------------------------------
-    # layervec
-    # ------------------------------------------------------------
-    mkdir -p "${base_dir}/layervec"
-
+    layervec_dir="${base_dir}/layervec"
     save_name="$(basename "$base_dir")_sdxl_refined"
 
-    python "$MAIN_PY" \
-        --config "$CONFIG" \
-        --target_image "$refined_particles" \
-        --file_save_name "$(basename "$base_dir")_sdxl_refined" \
-        --output_root "${base_dir}/layervec"
+    if [ -d "$layervec_dir" ] && [ "$(ls -A "$layervec_dir")" ]; then
+        echo "[Skip] layervec output_root already exists and is not empty: $layervec_dir"
+    else
+        mkdir -p "$layervec_dir"
+
+        python "$MAIN_PY" \
+            --config "$CONFIG" \
+            --target_image "$refined_particles" \
+            --file_save_name "$save_name" \
+            --output_root "$layervec_dir"
+    fi        
 done
