@@ -90,7 +90,14 @@ for f in "${matched_files[@]}"; do
 
     if [ -f "$final_svg" ]; then
         echo "[Skip] layervec final.svg exists: $final_svg"
-        find "$run_output_dir" -mindepth 1 ! -name 'final.svg' -exec rm -rf {} +
+        shopt -s nullglob dotglob
+        for item in "$run_output_dir"/*; do
+            if [ "$(basename "$item")" = "final.svg" ]; then
+                continue
+            fi
+            rm -rf "$item"
+        done
+        shopt -u dotglob
         echo "[Info] Cleaned layervec output, kept only final.svg: $run_output_dir"
     else
         if [ -d "$run_output_dir" ]; then
@@ -108,7 +115,14 @@ for f in "${matched_files[@]}"; do
 
         final_svg="${run_output_dir}/final.svg"
         if [ -f "$final_svg" ]; then
-            find "$run_output_dir" -mindepth 1 ! -name 'final.svg' -exec rm -rf {} +
+            shopt -s nullglob dotglob
+            for item in "$run_output_dir"/*; do
+                if [ "$(basename "$item")" = "final.svg" ]; then
+                    continue
+                fi
+                rm -rf "$item"
+            done
+            shopt -u dotglob
             echo "[Info] Cleaned layervec output after successful run, kept only final.svg: $run_output_dir"
         else
             echo "[Warn] layervec finished without final.svg: $run_output_dir"
