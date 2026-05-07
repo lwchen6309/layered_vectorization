@@ -48,11 +48,6 @@ for f in "${matched_files[@]}"; do
         continue
     fi
 
-    # ------------------------------------------------------------
-    # refine prompt (for all_particles)
-    # ------------------------------------------------------------
-    # refine_prompt="Ultra-realistic aerial photograph of ${original_prompt}, natural color grading, high dynamic range, professional wildlife photography, shot on a high-resolution DSLR."
-
     refined_particles="${base_dir}/all_particles_sdxl_refined.png"
 
     if [ ! -f "$refined_particles" ]; then
@@ -68,10 +63,6 @@ for f in "${matched_files[@]}"; do
         echo "[Skip] $refined_particles exists"
     fi
 
-    # ------------------------------------------------------------
-    # refine init_image (用原 prompt)
-    # ------------------------------------------------------------
-    # init_img="${base_dir}/init_image.png"
     init_img="${base_dir}/VPSD_svg_logs/svg_iter0_p0.svg"
     refined_init="${base_dir}/init_image_sdxl_refined.png"
 
@@ -94,10 +85,19 @@ for f in "${matched_files[@]}"; do
 
     layervec_dir="${base_dir}/layervec"
     save_name="$(basename "$base_dir")_sdxl_refined"
+    run_output_dir="${layervec_dir}/${save_name}"
+    final_svg="${run_output_dir}/final.svg"
 
-    if [ -d "$layervec_dir" ] && [ "$(ls -A "$layervec_dir")" ]; then
-        echo "[Skip] layervec output_root already exists and is not empty: $layervec_dir"
+    if [ -f "$final_svg" ]; then
+        echo "[Skip] layervec final.svg exists: $final_svg"
+        find "$run_output_dir" -mindepth 1 ! -name 'final.svg' -exec rm -rf {} +
+        echo "[Info] Cleaned layervec output, kept only final.svg: $run_output_dir"
     else
+        if [ -d "$run_output_dir" ]; then
+            echo "[Info] Incomplete layervec output detected, removing: $run_output_dir"
+            rm -rf "$run_output_dir"
+        fi
+
         mkdir -p "$layervec_dir"
 
         python "$MAIN_PY" \
@@ -105,5 +105,14 @@ for f in "${matched_files[@]}"; do
             --target_image "$refined_particles" \
             --file_save_name "$save_name" \
             --output_root "$layervec_dir"
-    fi        
+
+        final_svg="${run_output_dir}/final.svg"
+        if [ -f "$final_svg" ]; then
+            find "$run_output_dir" -mindepth 1 ! -name 'final.svg' -exec rm -rf {} +
+            echo "[Info] Cleaned layervec output after successful run, kept only final.svg: $run_output_dir"
+        else
+            echo "[Warn] layervec finished without final.svg: $run_output_dir"
+        fi
+    fi
+
 done
