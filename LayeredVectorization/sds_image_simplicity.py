@@ -1,4 +1,5 @@
 from typing import Tuple, Union, Optional, List
+import math
 import torch
 from torch.optim.sgd import SGD
 from diffusers import StableDiffusionPipeline, UNet2DConditionModel
@@ -14,24 +15,33 @@ T = torch.Tensor
 TN = Optional[T]
 TS = Union[Tuple[T, ...], List[T]]
 
+def _ceil_to_multiple(x: int, base: int) -> int:
+    return int(math.ceil(x / base) * base)
+
+
 def load_512(image_path: str, left=0, right=0, top=0, bottom=0):
-    image = Image.open(image_path).convert("RGB").resize((512, 512))
-    image = np.array(image)
-    
+    image = np.array(Image.open(image_path).convert("RGB"))
+
     h, w, c = image.shape
-    left = min(left, w-1)
+    left = min(left, w - 1)
     right = min(right, w - left - 1)
-    top = min(top, h - left - 1)
+    top = min(top, h - top - 1)
     bottom = min(bottom, h - top - 1)
     image = image[top:h-bottom, left:w-right]
+
     h, w, c = image.shape
-    if h < w:
-        offset = (w - h) // 2
-        image = image[:, offset:offset + h]
-    elif w < h:
-        offset = (h - w) // 2
-        image = image[offset:offset + w]
-    image = np.array(Image.fromarray(image).resize((512, 512)))
+    scale = max(512 / h, 512 / w, 1.0)
+    new_h = int(round(h * scale))
+    new_w = int(round(w * scale))
+    image = np.array(Image.fromarray(image).resize((new_w, new_h), Image.Resampling.BICUBIC))
+
+    pad_h = _ceil_to_multiple(new_h, 8)
+    pad_w = _ceil_to_multiple(new_w, 8)
+    pad_top = (pad_h - new_h) // 2
+    pad_bottom = pad_h - new_h - pad_top
+    pad_left = (pad_w - new_w) // 2
+    pad_right = pad_w - new_w - pad_left
+    image = np.pad(image, ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)), mode='edge')
     return image
 
 

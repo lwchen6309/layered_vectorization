@@ -351,8 +351,8 @@ def layered_vectorization(
         Image.fromarray(target_img_cluster).save(os.path.join(exp_dir, "cluster_img.png"))
         pydiffvg.save_svg(
             os.path.join(exp_dir, "color-adjusted.svg"),
-            img_height,
             img_width,
+            img_height,
             shapes,
             shape_groups,
         )
@@ -448,8 +448,8 @@ def layered_vectorization(
 
     pydiffvg.save_svg(
         os.path.join(exp_dir, "final.svg"),
-        img_height,
         img_width,
+        img_height,
         shapes,
         shape_groups,
     )
