@@ -709,6 +709,7 @@ def remove_lowquality_paths(shapes, shape_groups,device,
                 img_height: int,
                 visual_difference_threshold: float = 8.0,
                 struct_path_num: int = 0,
+                is_opt_list: List[int] = None,
                 ):
     img = svg_to_img(img_width,img_height,shapes,shape_groups,device)
     img = rgba_to_rgb(img,device)
@@ -729,6 +730,8 @@ def remove_lowquality_paths(shapes, shape_groups,device,
 
     shapes = [x for i,x in enumerate(shapes) if i not in remove_index_list]
     shape_groups = [x for i,x in enumerate(shape_groups) if i not in remove_index_list]
+    if is_opt_list is not None:
+        is_opt_list = [x for i, x in enumerate(is_opt_list) if i not in remove_index_list]
     for i in range(len(shape_groups)):
         shape_groups[i].shape_ids=torch.tensor([i])
-    return shapes,shape_groups
+    return shapes, shape_groups, is_opt_list

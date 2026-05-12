@@ -443,7 +443,7 @@ def layered_vectorization(
         if i == args.add_visual_path_num_iters - 1:
             break
 
-        shapes, shape_groups = remove_lowquality_paths(
+        shapes, shape_groups, is_opt_list = remove_lowquality_paths(
             shapes,
             shape_groups,
             device,
@@ -451,6 +451,7 @@ def layered_vectorization(
             img_height,
             visual_difference_threshold=args.paths_remove_visual_threshold,
             struct_path_num=struct_path_num,
+            is_opt_list=is_opt_list,
         )
 
         if debug_flow:
