@@ -33,6 +33,20 @@ def get_exp_dir(args) -> str:
     return os.path.join(args.output_root, args.file_save_name)
 
 
+def rescale_scene(shapes, src_width: int, src_height: int, dst_width: int, dst_height: int):
+    sx = float(dst_width) / float(src_width)
+    sy = float(dst_height) / float(src_height)
+    for path in shapes:
+        if hasattr(path, "points") and isinstance(path.points, torch.Tensor):
+            with torch.no_grad():
+                path.points[:, 0].mul_(sx)
+                path.points[:, 1].mul_(sy)
+        if hasattr(path, "stroke_width") and isinstance(path.stroke_width, torch.Tensor):
+            with torch.no_grad():
+                path.stroke_width.mul_(0.5 * (sx + sy))
+    return shapes
+
+
 def init_optimizer(
     shapes,
     shape_groups,
@@ -303,6 +317,8 @@ def layered_vectorization(
         pipe=pipe,
     )
 
+    orig_w, orig_h = Image.open(args.target_image).convert("RGB").size
+
     target_img = simp_img_seq[0]
     img_height, img_width = target_img.shape[:2]
 
@@ -446,10 +462,13 @@ def layered_vectorization(
             is_path_merging_phase=True,
         )
 
+    if img_width != orig_w or img_height != orig_h:
+        shapes = rescale_scene(shapes, img_width, img_height, orig_w, orig_h)
+
     pydiffvg.save_svg(
         os.path.join(exp_dir, "final.svg"),
-        img_width,
-        img_height,
+        orig_w,
+        orig_h,
         shapes,
         shape_groups,
     )
