@@ -33,6 +33,13 @@ def get_exp_dir(args) -> str:
     return os.path.join(args.output_root, args.file_save_name)
 
 
+def debug_state(tag: str, shapes, struct_path_num: int, is_opt_list):
+    visual_count = max(0, len(shapes) - int(struct_path_num))
+    opt_len = len(is_opt_list) if is_opt_list is not None else 0
+    opt_sum = sum(int(x) for x in is_opt_list) if is_opt_list is not None else 0
+    print(f"[DBG] {tag}: shapes={len(shapes)} struct={struct_path_num} visual={visual_count} opt_len={opt_len} opt_sum={opt_sum}")
+
+
 def rescale_scene(shapes, src_width: int, src_height: int, dst_width: int, dst_height: int):
     sx = float(dst_width) / float(src_width)
     sy = float(dst_height) / float(src_height)
@@ -386,6 +393,10 @@ def layered_vectorization(
     is_opt_list = []
     count = 0
     struct_path_num = len(shapes)
+    debug_flow = bool(getattr(args, "debug_flow", False))
+
+    if debug_flow:
+        debug_state("init_visual_refine", shapes, struct_path_num, is_opt_list)
 
     for i in range(args.add_visual_path_num_iters):
         add_dir = os.path.join(visual_svgs_save_path, f"{i}_add_paths")
@@ -407,6 +418,9 @@ def layered_vectorization(
             epsilon=args.approxpolydp_epsilon,
             N=remaining_path_num,
         )
+
+        if debug_flow:
+            debug_state(f"iter{i}_after_add_visual_paths", shapes, struct_path_num, is_opt_list)
 
         if struct_path_num == -1:
             print("There are no new paths to add.")
@@ -439,6 +453,9 @@ def layered_vectorization(
             struct_path_num=struct_path_num,
         )
 
+        if debug_flow:
+            debug_state(f"iter{i}_after_remove_lowquality", shapes, struct_path_num, is_opt_list)
+
         print("Path merging")
         merge_dir = os.path.join(visual_svgs_save_path, f"{i}_merge_paths")
         os.makedirs(merge_dir, exist_ok=True)
@@ -455,6 +472,9 @@ def layered_vectorization(
             color_threshold=args.paths_merge_color_threshold,
             overlapping_area_threshold=args.paths_merge_distance_threshold,
         )
+
+        if debug_flow:
+            debug_state(f"iter{i}_after_merge_path", shapes, struct_path_num, is_opt_list)
 
         shapes, shape_groups, count = svg_optimize_img_visual(
             device,
@@ -536,6 +556,11 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="Total number of splits (parallel jobs).",
+    )
+    parser.add_argument(
+        "--debug_flow",
+        action="store_true",
+        help="Print debug state for add/remove/merge path flow.",
     )
 
     args = parser.parse_args()

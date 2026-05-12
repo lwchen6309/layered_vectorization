@@ -650,7 +650,9 @@ def merge_path(shapes,shape_groups,device,
 
     record_list,merge_imgs,merge_color_list = merge_objs_based_on_threshold(path_raster_imgs,path_color_list)
 
-    flattened_record_list = [item for sublist in record_list for item in sublist]       
+    print(f"[DBG] merge_path: visual_before={len(visual_shapes)} merge_groups={len(record_list)} merge_imgs={len(merge_imgs)}")
+    flattened_record_list = [item for sublist in record_list for item in sublist]      
+    print(f"[DBG] merge_path: flattened_merged={len(flattened_record_list)}")
     visual_shapes = [x for i,x in enumerate(visual_shapes) if i not in flattened_record_list]
     visual_shape_groups = [x for i,x in enumerate(visual_shape_groups) if i not in flattened_record_list]
     is_opt_list = is_opt_list[:len(shapes)-len(flattened_record_list)]
