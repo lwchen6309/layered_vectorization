@@ -239,14 +239,22 @@ def svg_optimize_img_visual(
         )
         transparent_shape_groups.append(path_group)
 
-    svg_optimizer = init_optimizer(
-        shapes,
-        shape_groups,
-        train_conf["is_train_stroke"],
-        train_conf["is_train_visual_color"],
-        is_opt_list,
-        lr_base=base_lr_conf,
-    )
+    if len(is_opt_list) > 0 and sum(int(x) for x in is_opt_list) == 0:
+        return shapes, shape_groups, count
+
+    try:
+        svg_optimizer = init_optimizer(
+            shapes,
+            shape_groups,
+            train_conf["is_train_stroke"],
+            train_conf["is_train_visual_color"],
+            is_opt_list,
+            lr_base=base_lr_conf,
+        )
+    except ValueError as e:
+        if "empty parameter list" in str(e):
+            return shapes, shape_groups, count
+        raise
 
     num_iters = train_conf["visual_opt_num_iters"]
     if is_path_merging_phase:
