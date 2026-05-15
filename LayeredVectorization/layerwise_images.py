@@ -334,6 +334,64 @@ def save_layered_visualization(
     canvas.save(out_path)
 
 
+def _bucket_union_mask(mask_records: List[MaskRecord], mask_items: List[Dict], bucket_name: str) -> np.ndarray:
+    if not mask_items:
+        raise ValueError("mask_items must not be empty")
+
+    union = np.zeros(mask_items[0]["mask"].shape, dtype=bool)
+    for rec in mask_records:
+        if rec.depth_bucket != bucket_name:
+            continue
+        union |= mask_items[rec.mask_id]["mask"]
+    return union
+
+
+def save_layer_exports(
+    image_pil: Image.Image,
+    mask_records: List[MaskRecord],
+    mask_items: List[Dict],
+    output_dir: str,
+) -> Dict[str, str]:
+    image_rgb = np.array(image_pil.convert("RGB"))
+    layer_artifacts: Dict[str, str] = {}
+
+    bucket_masks = {
+        bucket_name: _bucket_union_mask(mask_records, mask_items, bucket_name)
+        for bucket_name in ("background", "midground", "foreground")
+    }
+
+    for bucket_name, bucket_mask in bucket_masks.items():
+        alpha = (bucket_mask.astype(np.uint8) * 255)
+        rgba = np.dstack([image_rgb, alpha])
+
+        layer_path = os.path.join(output_dir, f"{bucket_name}_layer.png")
+        mask_path = os.path.join(output_dir, f"{bucket_name}_mask.png")
+        Image.fromarray(rgba, mode="RGBA").save(layer_path)
+        Image.fromarray(alpha, mode="L").save(mask_path)
+
+        layer_artifacts[f"{bucket_name}_layer"] = os.path.abspath(layer_path)
+        layer_artifacts[f"{bucket_name}_mask"] = os.path.abspath(mask_path)
+
+    non_background_mask = bucket_masks["midground"] | bucket_masks["foreground"]
+    inpaint_mask_u8 = (non_background_mask.astype(np.uint8) * 255)
+    inpainted_bgr = cv2.inpaint(
+        cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR),
+        inpaint_mask_u8,
+        5,
+        cv2.INPAINT_TELEA,
+    )
+    inpainted_rgb = cv2.cvtColor(inpainted_bgr, cv2.COLOR_BGR2RGB)
+
+    inpaint_path = os.path.join(output_dir, "background_inpainted.png")
+    holes_mask_path = os.path.join(output_dir, "background_inpaint_mask.png")
+    Image.fromarray(inpainted_rgb).save(inpaint_path)
+    Image.fromarray(inpaint_mask_u8, mode="L").save(holes_mask_path)
+
+    layer_artifacts["background_inpainted"] = os.path.abspath(inpaint_path)
+    layer_artifacts["background_inpaint_mask"] = os.path.abspath(holes_mask_path)
+    return layer_artifacts
+
+
 # ---------- Main ----------
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Standalone SAM + depth layer visualization.")
@@ -420,6 +478,7 @@ def main() -> None:
         scale_step=args.scale_step,
         background_blur=args.background_blur,
     )
+    layer_artifacts = save_layer_exports(image_pil, mask_records, mask_items, args.output_dir)
 
     grouped = {
         "foreground": [],
@@ -445,12 +504,25 @@ def main() -> None:
             "depth_map": os.path.abspath(depth_path),
             "mask_depth_overlay": os.path.abspath(overlay_path),
             "layered_visualization": os.path.abspath(layered_path),
+            **layer_artifacts,
         },
     }
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
 
     print(json.dumps(metadata, indent=2))
+    print("\nNew inspection artifacts:")
+    for key in (
+        "background_layer",
+        "background_mask",
+        "midground_layer",
+        "midground_mask",
+        "foreground_layer",
+        "foreground_mask",
+        "background_inpainted",
+        "background_inpaint_mask",
+    ):
+        print(f"- {key}: {metadata['artifacts'][key]}")
     print(f"\nSaved outputs to: {os.path.abspath(args.output_dir)}")
 
 
