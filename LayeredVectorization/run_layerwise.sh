@@ -1,0 +1,1 @@
+python layerwise_images.py --image /data/leuven/362/vsc36208/layered_vectorization/LayeredVectorization/target_imgs/scene.jpg
