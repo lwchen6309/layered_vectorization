@@ -31,8 +31,9 @@ DEFAULT_INPAINT_NEGATIVE_PROMPT = (
 
 
 @dataclass
-class MaskRecord:
-    mask_id: int
+class RegionRecord:
+    region_id: int
+    source_mask_id: int
     area: int
     bbox_xyxy: List[int]
     center_xy: List[float]
@@ -41,13 +42,22 @@ class MaskRecord:
     mean_depth: float
     median_depth: float
     depth_score: float
-    depth_bucket: str
+    normalized_depth_score: float
+    depth_rank: int
+    layer_id: int
+    layer_name: str
 
 
 @dataclass
-class LayerBucket:
+class LayerRecord:
+    layer_id: int
     name: str
-    masks: List[MaskRecord]
+    region_ids: List[int]
+    num_regions: int
+    total_area: int
+    mean_depth_score: float
+    min_depth_score: float
+    max_depth_score: float
 
 
 # ---------- SAM helpers ----------
@@ -173,16 +183,65 @@ def run_depth_estimation(depth_bundle, image_pil: Image.Image, device: torch.dev
     return depth
 
 
-def build_depth_scores(
+def _mask_to_bbox(seg: np.ndarray) -> List[int]:
+    ys, xs = np.where(seg)
+    if len(xs) == 0:
+        return [0, 0, 0, 0]
+    return [int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1]
+
+
+def collect_mask_regions(
     masks: List[Dict],
+    *,
+    min_region_area: int,
+) -> List[Dict]:
+    regions: List[Dict] = []
+
+    for mask_idx, item in enumerate(masks):
+        seg_u8 = item["mask"].astype(np.uint8)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(seg_u8, connectivity=8)
+        for label in range(1, num_labels):
+            area = int(stats[label, cv2.CC_STAT_AREA])
+            if area < min_region_area:
+                continue
+            region_mask = labels == label
+            if not region_mask.any():
+                continue
+            x = int(stats[label, cv2.CC_STAT_LEFT])
+            y = int(stats[label, cv2.CC_STAT_TOP])
+            w = int(stats[label, cv2.CC_STAT_WIDTH])
+            h = int(stats[label, cv2.CC_STAT_HEIGHT])
+            regions.append(
+                {
+                    "source_mask_id": mask_idx,
+                    "mask": region_mask,
+                    "area": area,
+                    "bbox_xyxy": [x, y, x + w, y + h],
+                    "sam_score": float(item["sam_score"]),
+                    "stability_score": float(item["stability_score"]),
+                }
+            )
+
+    if not regions:
+        return []
+
+    regions.sort(key=lambda item: item["area"], reverse=True)
+    for region_id, region in enumerate(regions):
+        region["region_id"] = region_id
+    return regions
+
+
+def assign_depth_layers(
+    regions: List[Dict],
     depth_map: np.ndarray,
     *,
     near_mode: str,
-) -> Tuple[List[MaskRecord], List[float]]:
-    records: List[MaskRecord] = []
-    raw_scores: List[float] = []
+    layer_depth_threshold: float,
+    max_layers: int,
+) -> Tuple[List[RegionRecord], List[LayerRecord]]:
+    records: List[RegionRecord] = []
 
-    for local_id, item in enumerate(masks):
+    for item in regions:
         seg = item["mask"]
         ys, xs = np.where(seg)
         if len(xs) == 0:
@@ -190,50 +249,96 @@ def build_depth_scores(
         values = depth_map[seg]
         mean_depth = float(values.mean())
         median_depth = float(np.median(values))
-        raw_score = median_depth
-        if near_mode == "small":
-            depth_score = 1.0 - raw_score
-        else:
-            depth_score = raw_score
-        raw_scores.append(depth_score)
+        raw_score = mean_depth
+        depth_score = 1.0 - raw_score if near_mode == "small" else raw_score
 
-        x0, y0, x1, y1 = item["bbox_xyxy"]
         records.append(
-            MaskRecord(
-                mask_id=local_id,
+            RegionRecord(
+                region_id=int(item["region_id"]),
+                source_mask_id=int(item["source_mask_id"]),
                 area=int(item["area"]),
-                bbox_xyxy=[int(x0), int(y0), int(x1), int(y1)],
+                bbox_xyxy=[int(v) for v in item["bbox_xyxy"]],
                 center_xy=[float(xs.mean()), float(ys.mean())],
                 sam_score=float(item["sam_score"]),
                 stability_score=float(item["stability_score"]),
                 mean_depth=mean_depth,
                 median_depth=median_depth,
                 depth_score=float(depth_score),
-                depth_bucket="",
+                normalized_depth_score=0.0,
+                depth_rank=-1,
+                layer_id=-1,
+                layer_name="",
             )
         )
 
     if not records:
         return [], []
 
-    scores_np = np.asarray(raw_scores, dtype=np.float32)
-    if len(scores_np) == 1:
-        thresholds = [scores_np[0], scores_np[0]]
-    elif len(scores_np) == 2:
-        thresholds = [float(np.min(scores_np)), float(np.max(scores_np))]
+    scores = np.asarray([rec.depth_score for rec in records], dtype=np.float32)
+    min_score = float(scores.min())
+    max_score = float(scores.max())
+    span = max(max_score - min_score, 1e-8)
+    for rec in records:
+        rec.normalized_depth_score = float((rec.depth_score - min_score) / span)
+
+    ordered = sorted(records, key=lambda rec: rec.depth_score)
+    current_layer: List[RegionRecord] = []
+    grouped_layers: List[List[RegionRecord]] = []
+
+    for rec in ordered:
+        if not current_layer:
+            current_layer = [rec]
+            continue
+        current_scores = [item.depth_score for item in current_layer]
+        current_mean = float(np.mean(current_scores))
+        score_gap = abs(rec.depth_score - current_mean)
+        if score_gap <= layer_depth_threshold or (max_layers > 0 and len(grouped_layers) + 1 >= max_layers):
+            current_layer.append(rec)
+        else:
+            grouped_layers.append(current_layer)
+            current_layer = [rec]
+    if current_layer:
+        grouped_layers.append(current_layer)
+
+    layer_records: List[LayerRecord] = []
+    total_layers = len(grouped_layers)
+    for layer_idx, layer_regions in enumerate(grouped_layers):
+        layer_name = f"layer_{layer_idx:02d}"
+        for depth_rank, rec in enumerate(layer_regions):
+            rec.layer_id = layer_idx
+            rec.layer_name = layer_name
+            rec.depth_rank = depth_rank
+        scores_layer = [rec.depth_score for rec in layer_regions]
+        layer_records.append(
+            LayerRecord(
+                layer_id=layer_idx,
+                name=layer_name,
+                region_ids=[rec.region_id for rec in layer_regions],
+                num_regions=len(layer_regions),
+                total_area=int(sum(rec.area for rec in layer_regions)),
+                mean_depth_score=float(np.mean(scores_layer)),
+                min_depth_score=float(np.min(scores_layer)),
+                max_depth_score=float(np.max(scores_layer)),
+            )
+        )
+
+    if total_layers == 1:
+        semantic_names = {0: "midground"}
+    elif total_layers == 2:
+        semantic_names = {0: "background", 1: "foreground"}
     else:
-        thresholds = [float(np.quantile(scores_np, 1.0 / 3.0)), float(np.quantile(scores_np, 2.0 / 3.0))]
+        semantic_names = {0: "background", total_layers - 1: "foreground"}
+        for idx in range(1, total_layers - 1):
+            semantic_names[idx] = "midground"
 
     for rec in records:
-        s = rec.depth_score
-        if s <= thresholds[0]:
-            rec.depth_bucket = "background"
-        elif s <= thresholds[1]:
-            rec.depth_bucket = "midground"
-        else:
-            rec.depth_bucket = "foreground"
+        rec.layer_name = f"{rec.layer_name}_{semantic_names.get(rec.layer_id, 'midground')}"
 
-    return records, thresholds
+    for layer in layer_records:
+        layer.name = f"{layer.name}_{semantic_names.get(layer.layer_id, 'midground')}"
+
+    records.sort(key=lambda rec: (rec.layer_id, rec.depth_score, -rec.area))
+    return records, layer_records
 
 
 # ---------- Inpainting helpers ----------
@@ -310,43 +415,50 @@ def save_depth_visual(depth_map: np.ndarray, path: str) -> None:
 def _alpha_sprite_from_mask(image_rgba: np.ndarray, mask: np.ndarray, bbox_xyxy: Sequence[int]) -> Image.Image:
     x0, y0, x1, y1 = bbox_xyxy
     crop_rgb = image_rgba[y0:y1, x0:x1, :3].copy()
-    crop_mask = (mask[y0:y1, x0:x1].astype(np.uint8) * 255)
+    crop_mask = mask[y0:y1, x0:x1].astype(np.uint8) * 255
     rgba = np.dstack([crop_rgb, crop_mask])
     return Image.fromarray(rgba, mode="RGBA")
 
 
+def _layer_palette(num_layers: int) -> Dict[int, Tuple[int, int, int]]:
+    colors: Dict[int, Tuple[int, int, int]] = {}
+    denom = max(num_layers - 1, 1)
+    for layer_id in range(num_layers):
+        hue = layer_id / denom
+        hsv = np.uint8([[[int(179 * hue), 200, 255]]])
+        rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)[0, 0]
+        colors[layer_id] = (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+    return colors
+
+
 def save_mask_overlay(
     image_pil: Image.Image,
-    mask_records: List[MaskRecord],
-    mask_items: List[Dict],
+    region_records: List[RegionRecord],
+    region_items: List[Dict],
     out_path: str,
 ) -> None:
     base = image_pil.convert("RGBA")
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
-    colors = {
-        "foreground": "#ff5f56",
-        "midground": "#ffbd2e",
-        "background": "#27c93f",
-    }
+    colors = _layer_palette(max((rec.layer_id for rec in region_records), default=-1) + 1)
 
-    for rec in sorted(mask_records, key=lambda r: r.area, reverse=True):
-        seg = mask_items[rec.mask_id]["mask"]
-        rgb = ImageColor.getrgb(colors[rec.depth_bucket])
+    for rec in sorted(region_records, key=lambda r: r.area, reverse=True):
+        seg = region_items[rec.region_id]["mask"]
+        rgb = colors[rec.layer_id]
         tint = np.zeros((seg.shape[0], seg.shape[1], 4), dtype=np.uint8)
         tint[seg] = (*rgb, 90)
         overlay = Image.alpha_composite(overlay, Image.fromarray(tint, mode="RGBA"))
         x0, y0, x1, y1 = rec.bbox_xyxy
         draw.rectangle([x0, y0, x1, y1], outline=rgb + (255,), width=2)
-        draw.text((x0 + 4, y0 + 4), f"{rec.mask_id}:{rec.depth_bucket[0].upper()}", fill=rgb + (255,))
+        draw.text((x0 + 4, y0 + 4), f"R{rec.region_id}:L{rec.layer_id}", fill=rgb + (255,))
 
     Image.alpha_composite(base, overlay).save(out_path)
 
 
 def save_layered_visualization(
     image_pil: Image.Image,
-    mask_records: List[MaskRecord],
-    mask_items: List[Dict],
+    region_records: List[RegionRecord],
+    region_items: List[Dict],
     out_path: str,
     *,
     layer_step_x: int,
@@ -355,8 +467,12 @@ def save_layered_visualization(
     background_blur: float,
 ) -> None:
     w, h = image_pil.size
-    pad_x = max(80, layer_step_x * 5)
-    pad_y = max(60, layer_step_y * 5)
+    max_layer_id = max((rec.layer_id for rec in region_records), default=0)
+    num_layers = max_layer_id + 1
+    center_idx = (num_layers - 1) / 2.0
+
+    pad_x = max(80, layer_step_x * max(num_layers + 2, 5))
+    pad_y = max(60, layer_step_y * max(num_layers + 2, 5))
     canvas = Image.new("RGBA", (w + pad_x * 2, h + pad_y * 2), (250, 250, 252, 255))
 
     bg = image_pil.convert("RGBA")
@@ -364,25 +480,20 @@ def save_layered_visualization(
         bg = bg.filter(ImageFilter.GaussianBlur(radius=background_blur))
     canvas.alpha_composite(bg, (pad_x, pad_y))
 
-    layer_rank = {"background": 0, "midground": 1, "foreground": 2}
-    sorted_records = sorted(
-        mask_records,
-        key=lambda r: (layer_rank[r.depth_bucket], r.depth_score, r.area),
-    )
-
+    sorted_records = sorted(region_records, key=lambda r: (r.layer_id, r.depth_score, r.area))
     image_rgba = np.array(image_pil.convert("RGBA"))
 
     for rec in sorted_records:
-        item = mask_items[rec.mask_id]
+        item = region_items[rec.region_id]
         sprite = _alpha_sprite_from_mask(image_rgba, item["mask"], rec.bbox_xyxy)
         x0, y0, x1, y1 = rec.bbox_xyxy
         cx = (x0 + x1) / 2.0
         cy = (y0 + y1) / 2.0
 
-        bucket_idx = layer_rank[rec.depth_bucket]
-        shift_x = int((bucket_idx - 1) * layer_step_x)
-        shift_y = int((1 - bucket_idx) * layer_step_y)
-        scale = 1.0 + bucket_idx * scale_step
+        offset = rec.layer_id - center_idx
+        shift_x = int(offset * layer_step_x)
+        shift_y = int(-offset * layer_step_y)
+        scale = max(0.2, 1.0 + offset * scale_step)
 
         new_w = max(2, int(sprite.size[0] * scale))
         new_h = max(2, int(sprite.size[1] * scale))
@@ -391,7 +502,6 @@ def save_layered_visualization(
         paste_x = int(pad_x + cx - new_w / 2 + shift_x)
         paste_y = int(pad_y + cy - new_h / 2 + shift_y)
 
-        shadow = Image.new("RGBA", sprite.size, (0, 0, 0, 0))
         shadow_alpha = np.array(sprite.getchannel("A"), dtype=np.uint8)
         shadow_rgba = np.zeros((sprite.size[1], sprite.size[0], 4), dtype=np.uint8)
         shadow_rgba[..., 3] = (shadow_alpha * 0.28).astype(np.uint8)
@@ -400,26 +510,27 @@ def save_layered_visualization(
         canvas.alpha_composite(sprite, (paste_x, paste_y))
 
     legend = ImageDraw.Draw(canvas)
-    legend.text((24, 20), "Layerwise view: background → midground → foreground", fill=(30, 30, 30, 255))
+    legend.text((24, 20), "Layerwise view by connected regions (far → near)", fill=(30, 30, 30, 255))
     canvas.save(out_path)
 
 
-def _bucket_union_mask(mask_records: List[MaskRecord], mask_items: List[Dict], bucket_name: str) -> np.ndarray:
-    if not mask_items:
-        raise ValueError("mask_items must not be empty")
+def _layer_union_mask(region_records: List[RegionRecord], region_items: List[Dict], layer_id: int) -> np.ndarray:
+    if not region_items:
+        raise ValueError("region_items must not be empty")
 
-    union = np.zeros(mask_items[0]["mask"].shape, dtype=bool)
-    for rec in mask_records:
-        if rec.depth_bucket != bucket_name:
+    union = np.zeros(region_items[0]["mask"].shape, dtype=bool)
+    for rec in region_records:
+        if rec.layer_id != layer_id:
             continue
-        union |= mask_items[rec.mask_id]["mask"]
+        union |= region_items[rec.region_id]["mask"]
     return union
 
 
 def save_layer_exports(
     image_pil: Image.Image,
-    mask_records: List[MaskRecord],
-    mask_items: List[Dict],
+    region_records: List[RegionRecord],
+    region_items: List[Dict],
+    layer_records: List[LayerRecord],
     output_dir: str,
     *,
     inpaint_pipe=None,
@@ -433,26 +544,31 @@ def save_layer_exports(
     image_rgb = np.array(image_pil.convert("RGB"))
     layer_artifacts: Dict[str, str] = {}
 
-    bucket_masks = {
-        bucket_name: _bucket_union_mask(mask_records, mask_items, bucket_name)
-        for bucket_name in ("background", "midground", "foreground")
+    layer_masks = {
+        layer.layer_id: _layer_union_mask(region_records, region_items, layer.layer_id)
+        for layer in layer_records
     }
 
-    for bucket_name, bucket_mask in bucket_masks.items():
-        alpha = (bucket_mask.astype(np.uint8) * 255)
+    for layer in layer_records:
+        layer_mask = layer_masks[layer.layer_id]
+        alpha = layer_mask.astype(np.uint8) * 255
         rgba = np.dstack([image_rgb, alpha])
 
-        layer_path = os.path.join(output_dir, f"{bucket_name}_layer.png")
-        mask_path = os.path.join(output_dir, f"{bucket_name}_mask.png")
+        layer_path = os.path.join(output_dir, f"{layer.name}_layer.png")
+        mask_path = os.path.join(output_dir, f"{layer.name}_mask.png")
         Image.fromarray(rgba, mode="RGBA").save(layer_path)
         Image.fromarray(alpha, mode="L").save(mask_path)
 
-        layer_artifacts[f"{bucket_name}_layer"] = os.path.abspath(layer_path)
-        layer_artifacts[f"{bucket_name}_mask"] = os.path.abspath(mask_path)
+        layer_artifacts[f"{layer.name}_layer"] = os.path.abspath(layer_path)
+        layer_artifacts[f"{layer.name}_mask"] = os.path.abspath(mask_path)
 
-    non_background_mask = bucket_masks["midground"] | bucket_masks["foreground"]
+    non_background_layers = [layer.layer_id for layer in layer_records[1:]]
+    non_background_mask = np.zeros(image_rgb.shape[:2], dtype=bool)
+    for layer_id in non_background_layers:
+        non_background_mask |= layer_masks[layer_id]
+
     inpaint_mask = _dilate_mask(non_background_mask, inpaint_mask_dilate)
-    inpaint_mask_u8 = (inpaint_mask.astype(np.uint8) * 255)
+    inpaint_mask_u8 = inpaint_mask.astype(np.uint8) * 255
 
     if inpaint_pipe is not None:
         inpainted_rgb = np.array(
@@ -510,6 +626,18 @@ def parse_args() -> argparse.Namespace:
         choices=["large", "small"],
         default="large",
         help="Interpret larger depth values as nearer (default, often right for DPT/Depth Anything) or smaller as nearer.",
+    )
+    parser.add_argument(
+        "--layer-depth-threshold",
+        type=float,
+        default=0.08,
+        help="Merge adjacent depth-sorted regions into the same layer when their depth scores are within this threshold.",
+    )
+    parser.add_argument(
+        "--max-depth-layers",
+        type=int,
+        default=6,
+        help="Upper bound on the number of merged depth layers to emit. Use <=0 for no explicit cap.",
     )
     parser.add_argument("--layer-step-x", type=int, default=40)
     parser.add_argument("--layer-step-y", type=int, default=22)
@@ -580,9 +708,19 @@ def main() -> None:
 
     depth_pipe, used_depth_model = load_depth_estimator(args.depth_model, device=device)
     depth_map = run_depth_estimation(depth_pipe, image_pil, device=device)
-    mask_records, thresholds = build_depth_scores(mask_items, depth_map, near_mode=args.near_mode)
-    if not mask_records:
-        raise RuntimeError("Depth scoring produced no valid masks.")
+    region_items = collect_mask_regions(mask_items, min_region_area=args.min_mask_region_area)
+    if not region_items:
+        raise RuntimeError("No usable connected regions found after splitting SAM masks. Try lowering --min-mask-region-area.")
+
+    region_records, layer_records = assign_depth_layers(
+        region_items,
+        depth_map,
+        near_mode=args.near_mode,
+        layer_depth_threshold=args.layer_depth_threshold,
+        max_layers=args.max_depth_layers,
+    )
+    if not region_records:
+        raise RuntimeError("Depth scoring produced no valid regions.")
 
     inpaint_pipe = None
     used_inpaint_backend = "opencv-telea"
@@ -596,11 +734,11 @@ def main() -> None:
     metadata_path = os.path.join(args.output_dir, "mask_depth_metadata.json")
 
     save_depth_visual(depth_map, depth_path)
-    save_mask_overlay(image_pil, mask_records, mask_items, overlay_path)
+    save_mask_overlay(image_pil, region_records, region_items, overlay_path)
     save_layered_visualization(
         image_pil,
-        mask_records,
-        mask_items,
+        region_records,
+        region_items,
         layered_path,
         layer_step_x=args.layer_step_x,
         layer_step_y=args.layer_step_y,
@@ -609,8 +747,9 @@ def main() -> None:
     )
     layer_artifacts = save_layer_exports(
         image_pil,
-        mask_records,
-        mask_items,
+        region_records,
+        region_items,
+        layer_records,
         args.output_dir,
         inpaint_pipe=inpaint_pipe,
         inpaint_prompt=args.inpaint_prompt,
@@ -621,13 +760,10 @@ def main() -> None:
         inpaint_mask_dilate=args.inpaint_mask_dilate,
     )
 
-    grouped = {
-        "foreground": [],
-        "midground": [],
-        "background": [],
+    grouped_layers = {
+        layer.name: [asdict(rec) for rec in sorted(region_records, key=lambda r: (r.layer_id, r.depth_score, -r.area)) if rec.layer_id == layer.layer_id]
+        for layer in layer_records
     }
-    for rec in sorted(mask_records, key=lambda r: r.depth_score, reverse=True):
-        grouped[rec.depth_bucket].append(asdict(rec))
 
     metadata = {
         "input_image": os.path.abspath(args.image),
@@ -643,12 +779,13 @@ def main() -> None:
         "inpaint_guidance_scale": float(args.inpaint_guidance_scale),
         "inpaint_strength": float(args.inpaint_strength),
         "inpaint_mask_dilate": int(args.inpaint_mask_dilate),
-        "num_masks": len(mask_records),
-        "depth_thresholds": {
-            "background_to_midground": float(thresholds[0]),
-            "midground_to_foreground": float(thresholds[1]),
-        },
-        "layers": grouped,
+        "num_masks": len(mask_items),
+        "num_regions": len(region_records),
+        "num_layers": len(layer_records),
+        "layer_depth_threshold": float(args.layer_depth_threshold),
+        "max_depth_layers": int(args.max_depth_layers),
+        "layers": [asdict(layer) for layer in layer_records],
+        "regions_by_layer": grouped_layers,
         "artifacts": {
             "depth_map": os.path.abspath(depth_path),
             "mask_depth_overlay": os.path.abspath(overlay_path),
@@ -661,17 +798,8 @@ def main() -> None:
 
     print(json.dumps(metadata, indent=2))
     print("\nNew inspection artifacts:")
-    for key in (
-        "background_layer",
-        "background_mask",
-        "midground_layer",
-        "midground_mask",
-        "foreground_layer",
-        "foreground_mask",
-        "background_inpainted",
-        "background_inpaint_mask",
-    ):
-        print(f"- {key}: {metadata['artifacts'][key]}")
+    for key, value in metadata["artifacts"].items():
+        print(f"- {key}: {value}")
     print(f"\nSaved outputs to: {os.path.abspath(args.output_dir)}")
 
 
