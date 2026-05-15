@@ -11,7 +11,7 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image, ImageColor, ImageDraw, ImageFilter
-from transformers import pipeline
+from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 
 from obj_detect_sam import init_sam_mask_generator
 
@@ -126,7 +126,6 @@ def collect_sam_masks(
 
 # ---------- Depth helpers ----------
 def load_depth_estimator(model_name: str | None = None, device: torch.device | None = None):
-    device_index = 0 if (device is not None and device.type == "cuda") else -1
     tried: List[str] = []
     model_names = [model_name] if model_name else list(DEFAULT_DEPTH_MODELS)
 
@@ -134,7 +133,12 @@ def load_depth_estimator(model_name: str | None = None, device: torch.device | N
     for name in model_names:
         tried.append(name)
         try:
-            return pipeline("depth-estimation", model=name, device=device_index), name
+            processor = AutoImageProcessor.from_pretrained(name)
+            model = AutoModelForDepthEstimation.from_pretrained(name)
+            if device is not None:
+                model = model.to(device)
+            model.eval()
+            return (processor, model), name
         except Exception as exc:  # pragma: no cover - best effort fallback
             last_err = exc
 
@@ -142,17 +146,17 @@ def load_depth_estimator(model_name: str | None = None, device: torch.device | N
     raise RuntimeError(f"Failed to load any depth-estimation model: {names}\nLast error: {last_err}")
 
 
-def run_depth_estimation(depth_pipe, image_pil: Image.Image) -> np.ndarray:
-    result = depth_pipe(image_pil)
-    depth = result["depth"]
-    if isinstance(depth, Image.Image):
-        depth = np.array(depth).astype(np.float32)
-    else:
-        depth = np.array(depth).astype(np.float32)
+def run_depth_estimation(depth_bundle, image_pil: Image.Image, device: torch.device | None = None) -> np.ndarray:
+    processor, model = depth_bundle
+    inputs = processor(images=image_pil, return_tensors="pt")
+    if device is not None:
+        inputs = {k: v.to(device) for k, v in inputs.items()}
 
-    if depth.ndim == 3:
-        depth = depth[..., 0]
+    with torch.no_grad():
+        outputs = model(**inputs)
+        predicted_depth = outputs.predicted_depth
 
+    depth = predicted_depth.squeeze().detach().float().cpu().numpy()
     depth = cv2.resize(depth, image_pil.size, interpolation=cv2.INTER_CUBIC)
     depth = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
     depth -= depth.min()
@@ -334,7 +338,7 @@ def save_layered_visualization(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Standalone SAM + depth layer visualization.")
     parser.add_argument("--image", required=True, help="Input image path.")
-    parser.add_argument("--sam-checkpoint", required=True, help="Path to SAM checkpoint (.pth).")
+    parser.add_argument("--sam-checkpoint", default="sam_vit_h_4b8939.pth", help="Path to SAM checkpoint (.pth).")
     parser.add_argument("--sam-model-type", default="vit_h", choices=["vit_h", "vit_l", "vit_b"])
     parser.add_argument("--depth-model", default=None, help="Optional HF depth model override.")
     parser.add_argument("--output-dir", default="outputs/layerwise_images")
@@ -394,7 +398,7 @@ def main() -> None:
         raise RuntimeError("No usable SAM masks found. Try lowering --min-area-frac or SAM thresholds.")
 
     depth_pipe, used_depth_model = load_depth_estimator(args.depth_model, device=device)
-    depth_map = run_depth_estimation(depth_pipe, image_pil)
+    depth_map = run_depth_estimation(depth_pipe, image_pil, device=device)
     mask_records, thresholds = build_depth_scores(mask_items, depth_map, near_mode=args.near_mode)
     if not mask_records:
         raise RuntimeError("Depth scoring produced no valid masks.")
