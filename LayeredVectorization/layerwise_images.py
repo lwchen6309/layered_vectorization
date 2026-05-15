@@ -12,6 +12,7 @@ import numpy as np
 import torch
 from PIL import Image, ImageColor, ImageDraw, ImageFilter
 from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+from diffusers import AutoPipelineForInpainting
 
 from obj_detect_sam import init_sam_mask_generator
 
@@ -20,6 +21,12 @@ DEFAULT_DEPTH_MODELS: Sequence[str] = (
     "LiheYoung/depth-anything-small-hf",
     "Intel/dpt-hybrid-midas",
     "Intel/dpt-large",
+)
+
+DEFAULT_INPAINT_MODEL = "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
+DEFAULT_INPAINT_NEGATIVE_PROMPT = (
+    "extra objects, duplicated objects, floating objects, warped geometry, blurry, distorted,"
+    " low quality, text, watermark"
 )
 
 
@@ -229,6 +236,69 @@ def build_depth_scores(
     return records, thresholds
 
 
+# ---------- Inpainting helpers ----------
+def load_inpaint_pipeline(model_name: str, device: torch.device):
+    torch_dtype = torch.float16 if device.type == "cuda" else torch.float32
+    pipe = AutoPipelineForInpainting.from_pretrained(model_name, torch_dtype=torch_dtype)
+
+    if hasattr(pipe, "set_progress_bar_config"):
+        pipe.set_progress_bar_config(disable=True)
+
+    pipe = pipe.to(device)
+    return pipe
+
+
+def _dilate_mask(mask: np.ndarray, kernel_size: int) -> np.ndarray:
+    if kernel_size <= 0:
+        return mask.astype(bool)
+    kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+    dilated = cv2.dilate(mask.astype(np.uint8) * 255, kernel, iterations=1)
+    return dilated > 0
+
+
+def run_background_inpainting(
+    image_pil: Image.Image,
+    inpaint_mask: np.ndarray,
+    pipe,
+    *,
+    prompt: str,
+    negative_prompt: str,
+    strength: float,
+    guidance_scale: float,
+    steps: int,
+) -> Image.Image:
+    mask_bool = inpaint_mask.astype(bool)
+    if not mask_bool.any():
+        return image_pil.copy()
+
+    image_rgb = image_pil.convert("RGB")
+    mask_image = Image.fromarray((mask_bool.astype(np.uint8) * 255), mode="L")
+
+    width, height = image_rgb.size
+    out_w = max(8, (width // 8) * 8)
+    out_h = max(8, (height // 8) * 8)
+    if (out_w, out_h) != (width, height):
+        image_input = image_rgb.resize((out_w, out_h), Image.Resampling.LANCZOS)
+        mask_input = mask_image.resize((out_w, out_h), Image.Resampling.NEAREST)
+    else:
+        image_input = image_rgb
+        mask_input = mask_image
+
+    result = pipe(
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        image=image_input,
+        mask_image=mask_input,
+        guidance_scale=guidance_scale,
+        strength=strength,
+        num_inference_steps=steps,
+    ).images[0].convert("RGB")
+
+    if result.size != (width, height):
+        result = result.resize((width, height), Image.Resampling.LANCZOS)
+    return result
+
+
 # ---------- Visualization ----------
 def save_depth_visual(depth_map: np.ndarray, path: str) -> None:
     depth_u8 = np.clip(depth_map * 255.0, 0, 255).astype(np.uint8)
@@ -351,6 +421,14 @@ def save_layer_exports(
     mask_records: List[MaskRecord],
     mask_items: List[Dict],
     output_dir: str,
+    *,
+    inpaint_pipe=None,
+    inpaint_prompt: str = "",
+    inpaint_negative_prompt: str = DEFAULT_INPAINT_NEGATIVE_PROMPT,
+    inpaint_strength: float = 0.99,
+    inpaint_guidance_scale: float = 7.5,
+    inpaint_steps: int = 30,
+    inpaint_mask_dilate: int = 9,
 ) -> Dict[str, str]:
     image_rgb = np.array(image_pil.convert("RGB"))
     layer_artifacts: Dict[str, str] = {}
@@ -373,14 +451,30 @@ def save_layer_exports(
         layer_artifacts[f"{bucket_name}_mask"] = os.path.abspath(mask_path)
 
     non_background_mask = bucket_masks["midground"] | bucket_masks["foreground"]
-    inpaint_mask_u8 = (non_background_mask.astype(np.uint8) * 255)
-    inpainted_bgr = cv2.inpaint(
-        cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR),
-        inpaint_mask_u8,
-        5,
-        cv2.INPAINT_TELEA,
-    )
-    inpainted_rgb = cv2.cvtColor(inpainted_bgr, cv2.COLOR_BGR2RGB)
+    inpaint_mask = _dilate_mask(non_background_mask, inpaint_mask_dilate)
+    inpaint_mask_u8 = (inpaint_mask.astype(np.uint8) * 255)
+
+    if inpaint_pipe is not None:
+        inpainted_rgb = np.array(
+            run_background_inpainting(
+                image_pil,
+                inpaint_mask,
+                inpaint_pipe,
+                prompt=inpaint_prompt,
+                negative_prompt=inpaint_negative_prompt,
+                strength=inpaint_strength,
+                guidance_scale=inpaint_guidance_scale,
+                steps=inpaint_steps,
+            )
+        )
+    else:
+        inpainted_bgr = cv2.inpaint(
+            cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR),
+            inpaint_mask_u8,
+            5,
+            cv2.INPAINT_TELEA,
+        )
+        inpainted_rgb = cv2.cvtColor(inpainted_bgr, cv2.COLOR_BGR2RGB)
 
     inpaint_path = os.path.join(output_dir, "background_inpainted.png")
     holes_mask_path = os.path.join(output_dir, "background_inpaint_mask.png")
@@ -421,6 +515,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layer-step-y", type=int, default=22)
     parser.add_argument("--scale-step", type=float, default=0.06)
     parser.add_argument("--background-blur", type=float, default=4.0)
+    parser.add_argument(
+        "--inpaint-model",
+        default=DEFAULT_INPAINT_MODEL,
+        help="HF diffusers inpainting model id/path for background fill.",
+    )
+    parser.add_argument(
+        "--inpaint-prompt",
+        default="clean coherent background, natural continuation, no foreground objects",
+        help="Prompt used for the background inpainting model.",
+    )
+    parser.add_argument(
+        "--inpaint-negative-prompt",
+        default=DEFAULT_INPAINT_NEGATIVE_PROMPT,
+        help="Negative prompt used for the background inpainting model.",
+    )
+    parser.add_argument("--inpaint-steps", type=int, default=30)
+    parser.add_argument("--inpaint-guidance-scale", type=float, default=7.5)
+    parser.add_argument("--inpaint-strength", type=float, default=0.99)
+    parser.add_argument(
+        "--inpaint-mask-dilate",
+        type=int,
+        default=9,
+        help="Dilate the removed foreground/midground mask before inpainting.",
+    )
+    parser.add_argument(
+        "--fallback-opencv-inpaint",
+        action="store_true",
+        help="If set, skip diffusers and use the old OpenCV TELEA inpaint fallback.",
+    )
     return parser.parse_args()
 
 
@@ -461,6 +584,12 @@ def main() -> None:
     if not mask_records:
         raise RuntimeError("Depth scoring produced no valid masks.")
 
+    inpaint_pipe = None
+    used_inpaint_backend = "opencv-telea"
+    if not args.fallback_opencv_inpaint:
+        inpaint_pipe = load_inpaint_pipeline(args.inpaint_model, device=device)
+        used_inpaint_backend = "diffusers-sdxl"
+
     depth_path = os.path.join(args.output_dir, "depth_map.png")
     overlay_path = os.path.join(args.output_dir, "mask_depth_overlay.png")
     layered_path = os.path.join(args.output_dir, "layered_visualization.png")
@@ -478,7 +607,19 @@ def main() -> None:
         scale_step=args.scale_step,
         background_blur=args.background_blur,
     )
-    layer_artifacts = save_layer_exports(image_pil, mask_records, mask_items, args.output_dir)
+    layer_artifacts = save_layer_exports(
+        image_pil,
+        mask_records,
+        mask_items,
+        args.output_dir,
+        inpaint_pipe=inpaint_pipe,
+        inpaint_prompt=args.inpaint_prompt,
+        inpaint_negative_prompt=args.inpaint_negative_prompt,
+        inpaint_strength=args.inpaint_strength,
+        inpaint_guidance_scale=args.inpaint_guidance_scale,
+        inpaint_steps=args.inpaint_steps,
+        inpaint_mask_dilate=args.inpaint_mask_dilate,
+    )
 
     grouped = {
         "foreground": [],
@@ -494,6 +635,14 @@ def main() -> None:
         "sam_model_type": args.sam_model_type,
         "depth_model": used_depth_model,
         "near_mode": args.near_mode,
+        "inpaint_backend": used_inpaint_backend,
+        "inpaint_model": None if args.fallback_opencv_inpaint else args.inpaint_model,
+        "inpaint_prompt": args.inpaint_prompt,
+        "inpaint_negative_prompt": args.inpaint_negative_prompt,
+        "inpaint_steps": int(args.inpaint_steps),
+        "inpaint_guidance_scale": float(args.inpaint_guidance_scale),
+        "inpaint_strength": float(args.inpaint_strength),
+        "inpaint_mask_dilate": int(args.inpaint_mask_dilate),
         "num_masks": len(mask_records),
         "depth_thresholds": {
             "background_to_midground": float(thresholds[0]),
