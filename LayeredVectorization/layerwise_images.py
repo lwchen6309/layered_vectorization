@@ -11,7 +11,7 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image, ImageColor, ImageDraw, ImageFilter
-from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+from transformers import AutoImageProcessor, AutoModelForDepthEstimation, AutoModel, AutoTokenizer
 from diffusers import AutoPipelineForInpainting
 
 from obj_detect_sam import init_sam_mask_generator
@@ -24,6 +24,35 @@ DEFAULT_DEPTH_MODELS: Sequence[str] = (
 )
 
 DEFAULT_INPAINT_MODEL = "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
+DEFAULT_SEMANTIC_MODEL = "openai/clip-vit-base-patch32"
+DEFAULT_SEMANTIC_LABELS: Sequence[str] = (
+    "person",
+    "face",
+    "hand",
+    "animal",
+    "vehicle",
+    "bicycle",
+    "building",
+    "window",
+    "door",
+    "tree",
+    "plant",
+    "flower",
+    "sky",
+    "cloud",
+    "mountain",
+    "water",
+    "road",
+    "ground",
+    "furniture",
+    "table",
+    "chair",
+    "screen",
+    "book",
+    "food",
+    "background texture",
+    "foreground object",
+)
 DEFAULT_INPAINT_NEGATIVE_PROMPT = (
     "extra objects, duplicated objects, floating objects, warped geometry, blurry, distorted,"
     " low quality, text, watermark"
@@ -46,6 +75,8 @@ class RegionRecord:
     depth_rank: int
     layer_id: int
     layer_name: str
+    semantic_label: str
+    semantic_confidence: float
 
 
 @dataclass
@@ -55,6 +86,7 @@ class LayerRecord:
     region_ids: List[int]
     num_regions: int
     total_area: int
+    cluster_center_depth_score: float
     mean_depth_score: float
     min_depth_score: float
     max_depth_score: float
@@ -231,13 +263,118 @@ def collect_mask_regions(
     return regions
 
 
+def _kmeans_1d(x: np.ndarray, k: int) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float32).reshape(-1)
+    n = x.shape[0]
+    if n == 0:
+        return np.empty((0,), dtype=np.int32)
+
+    unique = np.unique(x)
+    k_eff = max(1, min(int(k), len(unique), n))
+    if k_eff == 1:
+        return np.zeros(n, dtype=np.int32)
+
+    percentiles = np.linspace(0, 100, k_eff + 2)[1:-1]
+    centers = np.percentile(x, percentiles).astype(np.float32)
+    labels = np.zeros(n, dtype=np.int32)
+
+    for _ in range(50):
+        dist = np.abs(x[:, None] - centers[None, :])
+        new_labels = np.argmin(dist, axis=1).astype(np.int32)
+        new_centers = centers.copy()
+        for idx in range(k_eff):
+            mask = new_labels == idx
+            if np.any(mask):
+                new_centers[idx] = float(x[mask].mean())
+        if np.array_equal(new_labels, labels) and np.allclose(new_centers, centers):
+            labels = new_labels
+            centers = new_centers
+            break
+        labels = new_labels
+        centers = new_centers
+
+    order = np.argsort(centers)
+    remap = {int(old): int(new) for new, old in enumerate(order.tolist())}
+    labels = np.array([remap[int(l)] for l in labels], dtype=np.int32)
+    return labels
+
+
+def load_semantic_encoder(model_name: str, device: torch.device):
+    processor = AutoImageProcessor.from_pretrained(model_name)
+    model = AutoModel.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = model.to(device)
+    model.eval()
+    return processor, model, tokenizer
+
+
+def _normalize_rows(matrix: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms = np.clip(norms, 1e-8, None)
+    return matrix / norms
+
+
+def build_region_semantic_features(
+    image_pil: Image.Image,
+    regions: List[Dict],
+    semantic_bundle,
+    *,
+    semantic_labels: Sequence[str],
+    device: torch.device,
+) -> List[Dict[str, object]]:
+    processor, model, tokenizer = semantic_bundle
+    image_rgb = image_pil.convert("RGB")
+    prompts = [f"a photo of {label}" for label in semantic_labels]
+
+    tokenized = tokenizer(prompts, padding=True, truncation=True, return_tensors="pt")
+    tokenized = {k: v.to(device) for k, v in tokenized.items()}
+    with torch.no_grad():
+        text_features = model.get_text_features(**tokenized)
+    text_features = text_features.detach().float().cpu().numpy()
+    text_features = _normalize_rows(text_features)
+
+    crops: List[Image.Image] = []
+    for item in regions:
+        x0, y0, x1, y1 = item["bbox_xyxy"]
+        crop = image_rgb.crop((x0, y0, x1, y1))
+        mask_crop = item["mask"][y0:y1, x0:x1]
+        crop_np = np.array(crop)
+        crop_np[~mask_crop] = crop_np[~mask_crop] // 3
+        crops.append(Image.fromarray(crop_np))
+
+    inputs = processor(images=crops, return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    with torch.no_grad():
+        image_features = model.get_image_features(**inputs)
+    image_features = image_features.detach().float().cpu().numpy()
+    image_features = _normalize_rows(image_features)
+
+    similarity = image_features @ text_features.T
+    results: List[Dict[str, object]] = []
+    for idx in range(len(regions)):
+        sim_row = similarity[idx]
+        best_idx = int(np.argmax(sim_row))
+        conf = float(sim_row[best_idx])
+        semantic_vector = sim_row.astype(np.float32)
+        norm = float(np.linalg.norm(semantic_vector))
+        if norm > 1e-8:
+            semantic_vector = semantic_vector / norm
+        results.append(
+            {
+                "semantic_label": semantic_labels[best_idx],
+                "semantic_confidence": conf,
+                "semantic_embedding": semantic_vector,
+            }
+        )
+    return results
+
+
 def assign_depth_layers(
     regions: List[Dict],
     depth_map: np.ndarray,
     *,
     near_mode: str,
-    layer_depth_threshold: float,
-    max_layers: int,
+    num_depth_layers: int,
 ) -> Tuple[List[RegionRecord], List[LayerRecord]]:
     records: List[RegionRecord] = []
 
@@ -268,6 +405,8 @@ def assign_depth_layers(
                 depth_rank=-1,
                 layer_id=-1,
                 layer_name="",
+                semantic_label=str(item.get("semantic_label", "unknown")),
+                semantic_confidence=float(item.get("semantic_confidence", 0.0)),
             )
         )
 
@@ -281,29 +420,40 @@ def assign_depth_layers(
     for rec in records:
         rec.normalized_depth_score = float((rec.depth_score - min_score) / span)
 
-    ordered = sorted(records, key=lambda rec: rec.depth_score)
-    current_layer: List[RegionRecord] = []
-    grouped_layers: List[List[RegionRecord]] = []
+    norm_scores = np.asarray([rec.normalized_depth_score for rec in records], dtype=np.float32)
+    labels = _kmeans_1d(norm_scores, num_depth_layers)
 
-    for rec in ordered:
-        if not current_layer:
-            current_layer = [rec]
-            continue
-        current_scores = [item.depth_score for item in current_layer]
-        current_mean = float(np.mean(current_scores))
-        score_gap = abs(rec.depth_score - current_mean)
-        if score_gap <= layer_depth_threshold or (max_layers > 0 and len(grouped_layers) + 1 >= max_layers):
-            current_layer.append(rec)
-        else:
-            grouped_layers.append(current_layer)
-            current_layer = [rec]
-    if current_layer:
-        grouped_layers.append(current_layer)
+    grouped_by_label: Dict[int, List[RegionRecord]] = {}
+    for rec, label in zip(records, labels):
+        grouped_by_label.setdefault(int(label), []).append(rec)
+
+    grouped_layers_unsorted = list(grouped_by_label.values())
+    grouped_layers_unsorted.sort(key=lambda layer_regions: float(np.mean([rec.depth_score for rec in layer_regions])))
+
+    total_layers = len(grouped_layers_unsorted)
+
+    def semantic_layer_name(layer_idx: int, total: int) -> str:
+        if total <= 1:
+            return "midground"
+        if total == 2:
+            return ["background", "foreground"][layer_idx]
+        if total == 3:
+            return ["background", "midground", "foreground"][layer_idx]
+        if layer_idx == 0:
+            return "background"
+        if layer_idx == total - 1:
+            return "foreground"
+        if layer_idx == total // 2:
+            return "midground"
+        if layer_idx < total // 2:
+            return f"background_plus_{layer_idx}"
+        return f"foreground_minus_{total - 1 - layer_idx}"
 
     layer_records: List[LayerRecord] = []
-    total_layers = len(grouped_layers)
-    for layer_idx, layer_regions in enumerate(grouped_layers):
-        layer_name = f"layer_{layer_idx:02d}"
+    for layer_idx, layer_regions in enumerate(grouped_layers_unsorted):
+        layer_regions.sort(key=lambda rec: (rec.depth_score, -rec.area))
+        semantic_name = semantic_layer_name(layer_idx, total_layers)
+        layer_name = f"layer_{layer_idx:02d}_{semantic_name}"
         for depth_rank, rec in enumerate(layer_regions):
             rec.layer_id = layer_idx
             rec.layer_name = layer_name
@@ -316,26 +466,12 @@ def assign_depth_layers(
                 region_ids=[rec.region_id for rec in layer_regions],
                 num_regions=len(layer_regions),
                 total_area=int(sum(rec.area for rec in layer_regions)),
+                cluster_center_depth_score=float(np.mean(scores_layer)),
                 mean_depth_score=float(np.mean(scores_layer)),
                 min_depth_score=float(np.min(scores_layer)),
                 max_depth_score=float(np.max(scores_layer)),
             )
         )
-
-    if total_layers == 1:
-        semantic_names = {0: "midground"}
-    elif total_layers == 2:
-        semantic_names = {0: "background", 1: "foreground"}
-    else:
-        semantic_names = {0: "background", total_layers - 1: "foreground"}
-        for idx in range(1, total_layers - 1):
-            semantic_names[idx] = "midground"
-
-    for rec in records:
-        rec.layer_name = f"{rec.layer_name}_{semantic_names.get(rec.layer_id, 'midground')}"
-
-    for layer in layer_records:
-        layer.name = f"{layer.name}_{semantic_names.get(layer.layer_id, 'midground')}"
 
     records.sort(key=lambda rec: (rec.layer_id, rec.depth_score, -rec.area))
     return records, layer_records
@@ -437,6 +573,7 @@ def save_mask_overlay(
     region_items: List[Dict],
     out_path: str,
 ) -> None:
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
     base = image_pil.convert("RGBA")
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
@@ -466,6 +603,7 @@ def save_layered_visualization(
     scale_step: float,
     background_blur: float,
 ) -> None:
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
     w, h = image_pil.size
     max_layer_id = max((rec.layer_id for rec in region_records), default=0)
     num_layers = max_layer_id + 1
@@ -543,6 +681,12 @@ def save_layer_exports(
 ) -> Dict[str, str]:
     image_rgb = np.array(image_pil.convert("RGB"))
     layer_artifacts: Dict[str, str] = {}
+    layers_dir = os.path.join(output_dir, "layers")
+    masks_dir = os.path.join(output_dir, "masks")
+    overlays_dir = os.path.join(output_dir, "overlays")
+    os.makedirs(layers_dir, exist_ok=True)
+    os.makedirs(masks_dir, exist_ok=True)
+    os.makedirs(overlays_dir, exist_ok=True)
 
     layer_masks = {
         layer.layer_id: _layer_union_mask(region_records, region_items, layer.layer_id)
@@ -554,8 +698,8 @@ def save_layer_exports(
         alpha = layer_mask.astype(np.uint8) * 255
         rgba = np.dstack([image_rgb, alpha])
 
-        layer_path = os.path.join(output_dir, f"{layer.name}_layer.png")
-        mask_path = os.path.join(output_dir, f"{layer.name}_mask.png")
+        layer_path = os.path.join(layers_dir, f"{layer.name}_layer.png")
+        mask_path = os.path.join(masks_dir, f"{layer.name}_mask.png")
         Image.fromarray(rgba, mode="RGBA").save(layer_path)
         Image.fromarray(alpha, mode="L").save(mask_path)
 
@@ -592,8 +736,8 @@ def save_layer_exports(
         )
         inpainted_rgb = cv2.cvtColor(inpainted_bgr, cv2.COLOR_BGR2RGB)
 
-    inpaint_path = os.path.join(output_dir, "background_inpainted.png")
-    holes_mask_path = os.path.join(output_dir, "background_inpaint_mask.png")
+    inpaint_path = os.path.join(layers_dir, "background_inpainted.png")
+    holes_mask_path = os.path.join(masks_dir, "background_inpaint_mask.png")
     Image.fromarray(inpainted_rgb).save(inpaint_path)
     Image.fromarray(inpaint_mask_u8, mode="L").save(holes_mask_path)
 
@@ -628,16 +772,32 @@ def parse_args() -> argparse.Namespace:
         help="Interpret larger depth values as nearer (default, often right for DPT/Depth Anything) or smaller as nearer.",
     )
     parser.add_argument(
-        "--layer-depth-threshold",
-        type=float,
-        default=0.08,
-        help="Merge adjacent depth-sorted regions into the same layer when their depth scores are within this threshold.",
+        "--num-depth-layers",
+        type=int,
+        default=2,
+        help="Number of depth layers for 1D k-means grouping.",
     )
     parser.add_argument(
-        "--max-depth-layers",
-        type=int,
-        default=6,
-        help="Upper bound on the number of merged depth layers to emit. Use <=0 for no explicit cap.",
+        "--semantic-model",
+        default=DEFAULT_SEMANTIC_MODEL,
+        help="HF CLIP-like model used to derive auxiliary semantic/text embeddings per region.",
+    )
+    parser.add_argument(
+        "--semantic-labels",
+        default=",".join(DEFAULT_SEMANTIC_LABELS),
+        help="Comma-separated label vocabulary used for auxiliary text-guided semantic region descriptors.",
+    )
+    parser.add_argument(
+        "--semantic-aux-weight",
+        type=float,
+        default=0.035,
+        help="How much semantic distance nudges clustering relative to depth distance. Keep small so depth dominates.",
+    )
+    parser.add_argument(
+        "--semantic-depth-gate",
+        type=float,
+        default=0.18,
+        help="Semantic cue is faded out as depth difference grows; smaller means semantics only disambiguate very similar depths.",
     )
     parser.add_argument("--layer-step-x", type=int, default=40)
     parser.add_argument("--layer-step-y", type=int, default=22)
@@ -712,12 +872,25 @@ def main() -> None:
     if not region_items:
         raise RuntimeError("No usable connected regions found after splitting SAM masks. Try lowering --min-mask-region-area.")
 
+    semantic_labels = [label.strip() for label in args.semantic_labels.split(",") if label.strip()]
+    if not semantic_labels:
+        semantic_labels = list(DEFAULT_SEMANTIC_LABELS)
+    semantic_bundle = load_semantic_encoder(args.semantic_model, device=device)
+    semantic_features = build_region_semantic_features(
+        image_pil,
+        region_items,
+        semantic_bundle,
+        semantic_labels=semantic_labels,
+        device=device,
+    )
+    for item, semantic in zip(region_items, semantic_features):
+        item.update(semantic)
+
     region_records, layer_records = assign_depth_layers(
         region_items,
         depth_map,
         near_mode=args.near_mode,
-        layer_depth_threshold=args.layer_depth_threshold,
-        max_layers=args.max_depth_layers,
+        num_depth_layers=args.num_depth_layers,
     )
     if not region_records:
         raise RuntimeError("Depth scoring produced no valid regions.")
@@ -728,9 +901,16 @@ def main() -> None:
         inpaint_pipe = load_inpaint_pipeline(args.inpaint_model, device=device)
         used_inpaint_backend = "diffusers-sdxl"
 
-    depth_path = os.path.join(args.output_dir, "depth_map.png")
-    overlay_path = os.path.join(args.output_dir, "mask_depth_overlay.png")
-    layered_path = os.path.join(args.output_dir, "layered_visualization.png")
+    overlays_dir = os.path.join(args.output_dir, "overlays")
+    masks_dir = os.path.join(args.output_dir, "masks")
+    layers_dir = os.path.join(args.output_dir, "layers")
+    os.makedirs(overlays_dir, exist_ok=True)
+    os.makedirs(masks_dir, exist_ok=True)
+    os.makedirs(layers_dir, exist_ok=True)
+
+    depth_path = os.path.join(overlays_dir, "depth_map.png")
+    overlay_path = os.path.join(overlays_dir, "mask_depth_overlay.png")
+    layered_path = os.path.join(overlays_dir, "layered_visualization.png")
     metadata_path = os.path.join(args.output_dir, "mask_depth_metadata.json")
 
     save_depth_visual(depth_map, depth_path)
@@ -771,6 +951,10 @@ def main() -> None:
         "sam_model_type": args.sam_model_type,
         "depth_model": used_depth_model,
         "near_mode": args.near_mode,
+        "semantic_model": args.semantic_model,
+        "semantic_labels": semantic_labels,
+        "semantic_aux_weight": float(args.semantic_aux_weight),
+        "semantic_depth_gate": float(args.semantic_depth_gate),
         "inpaint_backend": used_inpaint_backend,
         "inpaint_model": None if args.fallback_opencv_inpaint else args.inpaint_model,
         "inpaint_prompt": args.inpaint_prompt,
@@ -782,8 +966,9 @@ def main() -> None:
         "num_masks": len(mask_items),
         "num_regions": len(region_records),
         "num_layers": len(layer_records),
-        "layer_depth_threshold": float(args.layer_depth_threshold),
-        "max_depth_layers": int(args.max_depth_layers),
+        "num_depth_layers_requested": int(args.num_depth_layers),
+        "num_depth_layers_effective": len(layer_records),
+        "depth_grouping": "kmeans_1d_mean_depth",
         "layers": [asdict(layer) for layer in layer_records],
         "regions_by_layer": grouped_layers,
         "artifacts": {
