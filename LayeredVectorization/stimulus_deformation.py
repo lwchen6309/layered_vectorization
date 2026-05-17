@@ -101,6 +101,12 @@ def update_stimulus_svg(root: ET.Element, scale: float, translate: np.ndarray, r
             el.attrib["cy"] = f"{p2[1]:.6f}"
             el.attrib["rx"] = f"{float(el.attrib['rx']) * scale:.6f}"
             el.attrib["ry"] = f"{float(el.attrib['ry']) * scale:.6f}"
+        elif tag == f"{SVG_NS}circle":
+            p = np.array([float(el.attrib["cx"]), float(el.attrib["cy"])] , dtype=np.float64)
+            p2 = affine_transform_points(p[None, :], center, scale, translate, rotate_deg)[0]
+            el.attrib["cx"] = f"{p2[0]:.6f}"
+            el.attrib["cy"] = f"{p2[1]:.6f}"
+            el.attrib["r"] = f"{float(el.attrib['r']) * scale:.6f}"
         elif tag == f"{SVG_NS}rect":
             if el.attrib.get("fill") == "none":
                 continue
