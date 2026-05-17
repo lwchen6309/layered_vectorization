@@ -11,6 +11,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 import cairosvg
 import io
+from depth_main import _load_depth_estimator, _run_depth_estimation
 
 SVG_NS = "{http://www.w3.org/2000/svg}"
 NUMBER_RE = re.compile(r"[-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?")
@@ -38,6 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--translate-y", type=float, default=0.0, help="Translation in y applied after scaling.")
     parser.add_argument("--rotate-deg", type=float, default=0.0, help="Rotation in degrees applied around stimulus center.")
     parser.add_argument("--sigma", type=float, default=55.0, help="Gaussian field sigma in stimulus canvas coordinates.")
+    parser.add_argument("--depth-weight", type=float, default=120.0, help="Scale factor for depth channel when building the Gaussian field in (x, y, z) space.")
     parser.add_argument("--grid", type=int, default=300, help="Preview raster size for 2x2 plot.")
     return parser.parse_args()
 
@@ -133,13 +135,23 @@ def update_stimulus_svg(root: ET.Element, scale: float, translate: np.ndarray, r
     return root
 
 
-def gaussian_field_displacement(query_points: np.ndarray, src_points: np.ndarray, dst_points: np.ndarray, sigma: float) -> np.ndarray:
+def sample_depth_at_points(depth_map: np.ndarray, points: np.ndarray) -> np.ndarray:
+    h, w = depth_map.shape
+    xs = np.clip(np.round(points[:, 0]).astype(int), 0, w - 1)
+    ys = np.clip(np.round(points[:, 1]).astype(int), 0, h - 1)
+    return depth_map[ys, xs]
+
+
+def gaussian_field_displacement(query_points: np.ndarray, src_points: np.ndarray, dst_points: np.ndarray, sigma: float, query_depth: np.ndarray | None = None, src_depth: np.ndarray | None = None, depth_weight: float = 1.0) -> np.ndarray:
     disp = dst_points - src_points
     field = np.zeros_like(query_points, dtype=np.float64)
     weight_sum = np.zeros((query_points.shape[0], 1), dtype=np.float64)
     for i in range(src_points.shape[0]):
-        diff = query_points - src_points[i]
-        dist2 = np.sum(diff * diff, axis=1, keepdims=True)
+        diff_xy = query_points - src_points[i]
+        dist2 = np.sum(diff_xy * diff_xy, axis=1, keepdims=True)
+        if query_depth is not None and src_depth is not None:
+            dz = (query_depth - src_depth[i]).reshape(-1, 1) * depth_weight
+            dist2 = dist2 + dz * dz
         w = np.exp(-dist2 / (2.0 * sigma * sigma))
         field += w * disp[i]
         weight_sum += w
@@ -147,9 +159,10 @@ def gaussian_field_displacement(query_points: np.ndarray, src_points: np.ndarray
     return field / weight_sum
 
 
-def warp_svgcomp_paths(svg_root: ET.Element, src_pts: np.ndarray, dst_pts: np.ndarray, sigma: float) -> ET.Element:
+def warp_svgcomp_paths(svg_root: ET.Element, src_pts: np.ndarray, dst_pts: np.ndarray, sigma: float, depth_map: np.ndarray | None = None, depth_weight: float = 1.0) -> ET.Element:
     # Note: anchors come only from the stimulus. svgcomp contributes only query points to be warped.
     warped = copy.deepcopy(svg_root)
+    src_depth = sample_depth_at_points(depth_map, src_pts) if depth_map is not None else None
     for path_el in warped.iter():
         if path_el.tag != f"{SVG_NS}path":
             continue
@@ -160,7 +173,8 @@ def warp_svgcomp_paths(svg_root: ET.Element, src_pts: np.ndarray, dst_pts: np.nd
         if len(numbers) % 2 != 0:
             continue
         pts = np.array(numbers, dtype=np.float64).reshape(-1, 2)
-        disp = gaussian_field_displacement(pts, src_pts, dst_pts, sigma)
+        query_depth = sample_depth_at_points(depth_map, pts) if depth_map is not None else None
+        disp = gaussian_field_displacement(pts, src_pts, dst_pts, sigma, query_depth=query_depth, src_depth=src_depth, depth_weight=depth_weight)
         pts_warped = pts + disp
         replacement_vals = pts_warped.reshape(-1)
         idx = 0
@@ -236,12 +250,17 @@ def main() -> None:
     translate = np.array([args.translate_x, args.translate_y], dtype=np.float64)
     dst_pts = affine_transform_points(src_pts, center, args.scale, translate, args.rotate_deg)
 
+    image_pil = Image.open(args.svgcomp.parent.parent / 'target_img.png').convert('RGB') if (args.svgcomp.parent.parent / 'target_img.png').exists() else Image.open('/home/lwchen/layered_vectorization/LayeredVectorization/target_imgs/scene.jpg').convert('RGB')
+    depth_bundle, depth_model_name = _load_depth_estimator(device='cuda:0')
+    depth_map = _run_depth_estimation(depth_bundle, image_pil, device='cuda:0')
+
     new_stim_root = update_stimulus_svg(copy.deepcopy(stim_root), args.scale, translate, args.rotate_deg)
-    warped_svg_root = warp_svgcomp_paths(svgcomp_root, src_pts, dst_pts, args.sigma)
+    warped_svg_root = warp_svgcomp_paths(svgcomp_root, src_pts, dst_pts, args.sigma, depth_map=depth_map, depth_weight=args.depth_weight)
 
     disp = dst_pts - src_pts
     mag = np.linalg.norm(disp, axis=1)
-    print(f"[INFO] scale={args.scale}, translate=({args.translate_x}, {args.translate_y}), rotate_deg={args.rotate_deg}, sigma={args.sigma}")
+    print(f"[INFO] depth_model={depth_model_name}")
+    print(f"[INFO] scale={args.scale}, translate=({args.translate_x}, {args.translate_y}), rotate_deg={args.rotate_deg}, sigma={args.sigma}, depth_weight={args.depth_weight}")
     print(f"[INFO] anchors={len(src_pts)}, disp_mag_min={mag.min():.4f}, disp_mag_max={mag.max():.4f}, disp_mag_mean={mag.mean():.4f}")
 
     old_stim_path = args.output_dir / "stimulus_original.svg"
