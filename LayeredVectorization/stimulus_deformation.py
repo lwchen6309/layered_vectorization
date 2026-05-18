@@ -40,13 +40,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--translate-x", type=float, default=0.0, help="Translation in x applied after scaling.")
     parser.add_argument("--translate-y", type=float, default=0.0, help="Translation in y applied after scaling.")
     parser.add_argument("--rotate-deg", type=float, default=0.0, help="Rotation in degrees applied around stimulus center.")
+    parser.add_argument("--top-vertex-dy", type=float, default=0.0, help="If non-zero, move the top-most stimulus control upward/downward by this many pixels instead of global affine-only motion.")
     parser.add_argument("--sigma-xy", type=float, default=12.0, help="Gaussian sigma for x/y in stimulus canvas coordinates.")
     parser.add_argument("--sigma-z", type=float, default=0.3, help="Gaussian sigma for z/depth channel.")
     parser.add_argument("--depth-weight", type=float, default=1.0, help="Legacy compatibility knob; keep at 1.0 for pure (x, y, z) field.")
     parser.add_argument("--grid", type=int, default=300, help="Preview raster size for 2x2 plot.")
     parser.add_argument("--field-grid-step", type=int, default=24, help="Sampling step for full vector-field debug plot.")
-    parser.add_argument("--neighbor-threshold", type=float, default=40.0, help="If anchors are closer than this, reduce their field influence.")
-    parser.add_argument("--min-anchor-attenuation", type=float, default=0.35, help="Minimum attenuation applied to dense/nearby anchors.")
     parser.add_argument("--depth-model", type=str, default="depth-anything/Depth-Anything-V2-Small-hf", help="Depth model to use; keep on Depth Anything V2 Small unless explicitly testing another V2 checkpoint.")
     parser.add_argument("--run-inpaint", action="store_true", help="Run SDXL inpainting on uncovered regions after deformation. Off by default.")
     parser.add_argument("--inpaint-model", type=str, default="diffusers/stable-diffusion-xl-1.0-inpainting-0.1", help="SDXL inpainting model id.")
@@ -155,21 +154,8 @@ def sample_depth_at_points(depth_map: np.ndarray, points: np.ndarray) -> np.ndar
     return depth_map[ys, xs]
 
 
-def compute_anchor_attenuation(src_points: np.ndarray, neighbor_threshold: float, min_anchor_attenuation: float) -> np.ndarray:
-    n = src_points.shape[0]
-    if n <= 1:
-        return np.ones((n,), dtype=np.float64)
-    dmat = np.linalg.norm(src_points[:, None, :] - src_points[None, :, :], axis=2)
-    dmat[dmat == 0] = np.inf
-    nn = dmat.min(axis=1)
-    att = np.clip(nn / max(neighbor_threshold, 1e-8), min_anchor_attenuation, 1.0)
-    return att
-
-
 def gaussian_field_displacement(query_points: np.ndarray, src_points: np.ndarray, dst_points: np.ndarray, sigma_xy: float, sigma_z: float, query_depth: np.ndarray | None = None, src_depth: np.ndarray | None = None, depth_weight: float = 1.0, anchor_attenuation: np.ndarray | None = None) -> np.ndarray:
     disp = dst_points - src_points  # deformation vector is computed only on stimulus in xy
-    field = np.zeros_like(query_points, dtype=np.float64)
-    weight_sum = np.zeros((query_points.shape[0], 1), dtype=np.float64)
 
     if query_depth is None or src_depth is None:
         raise ValueError('Depth-aware xyz field requires both query_depth and src_depth.')
@@ -184,18 +170,12 @@ def gaussian_field_displacement(query_points: np.ndarray, src_points: np.ndarray
     ], axis=1)
     sigma_vec = np.array([sigma_xy, sigma_xy, sigma_z], dtype=np.float64)
 
-    if anchor_attenuation is None:
-        anchor_attenuation = np.ones((src_xyz.shape[0],), dtype=np.float64)
-
-    for i in range(src_xyz.shape[0]):
-        diff = (query_xyz - src_xyz[i]) / sigma_vec
-        dist2 = np.sum(diff * diff, axis=1, keepdims=True)
-        w = np.exp(-0.5 * dist2) * anchor_attenuation[i]
-        field += w * disp[i]
-        weight_sum += w
-
-    weight_sum = np.clip(weight_sum, 1e-8, None)
-    return field / weight_sum
+    diff = (query_xyz[:, None, :] - src_xyz[None, :, :]) / sigma_vec[None, None, :]
+    dist2 = np.sum(diff * diff, axis=2)
+    weights = np.exp(-0.5 * dist2)[:, :, None]  # (Q, A, 1)
+    disp_expanded = disp[None, :, :]            # (1, A, 2)
+    field = np.sum(weights * disp_expanded, axis=1)
+    return field
 
 
 def warp_svgcomp_paths(svg_root: ET.Element, src_pts: np.ndarray, dst_pts: np.ndarray, sigma_xy: float, sigma_z: float, depth_map: np.ndarray | None = None, depth_weight: float = 1.0, anchor_attenuation: np.ndarray | None = None) -> ET.Element:
@@ -389,6 +369,13 @@ def save_anchor_debug(src_pts: np.ndarray, dst_pts: np.ndarray, depth_map: np.nd
     plt.close(fig)
 
 
+def apply_top_vertex_shift(src_pts: np.ndarray, dy: float) -> np.ndarray:
+    dst = src_pts.copy()
+    top_idx = int(np.argmin(src_pts[:, 1]))
+    dst[top_idx, 1] += dy
+    return dst
+
+
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -403,7 +390,8 @@ def main() -> None:
     center = np.array([width / 2.0, height / 2.0], dtype=np.float64)
     translate = np.array([args.translate_x, args.translate_y], dtype=np.float64)
     dst_pts = affine_transform_points(src_pts, center, args.scale, translate, args.rotate_deg)
-    anchor_attenuation = compute_anchor_attenuation(src_pts, args.neighbor_threshold, args.min_anchor_attenuation)
+    if args.top_vertex_dy != 0.0:
+        dst_pts = apply_top_vertex_shift(src_pts, args.top_vertex_dy)
 
     candidate_images = [
         args.svgcomp.with_name('svgcomp.jpg'),
@@ -419,7 +407,30 @@ def main() -> None:
     depth_map = _run_depth_estimation(depth_bundle, image_pil, device='cuda:0')
 
     new_stim_root = update_stimulus_svg(copy.deepcopy(stim_root), args.scale, translate, args.rotate_deg)
-    warped_svg_root = warp_svgcomp_paths(svgcomp_root, src_pts, dst_pts, args.sigma_xy, args.sigma_z, depth_map=depth_map, depth_weight=args.depth_weight, anchor_attenuation=anchor_attenuation)
+    if args.top_vertex_dy != 0.0:
+        # override stimulus control display with per-anchor top-vertex move
+        moved_root = copy.deepcopy(old_stim_root)
+        moved_controls = collect_stimulus_controls(moved_root)
+        top_idx = int(np.argmin(src_pts[:, 1]))
+        for idx, (_, _, el) in enumerate(moved_controls):
+            if idx != top_idx:
+                continue
+            if el.tag == f"{SVG_NS}circle":
+                el.attrib['cy'] = f"{float(el.attrib['cy']) + args.top_vertex_dy:.6f}"
+            elif el.tag == f"{SVG_NS}ellipse":
+                el.attrib['cy'] = f"{float(el.attrib['cy']) + args.top_vertex_dy:.6f}"
+            elif el.tag == f"{SVG_NS}rect":
+                el.attrib['y'] = f"{float(el.attrib['y']) + args.top_vertex_dy:.6f}"
+            elif el.tag == f"{SVG_NS}polygon":
+                pts = []
+                for pair in el.attrib['points'].strip().split():
+                    x_str, y_str = pair.split(',')
+                    pts.append([float(x_str), float(y_str)])
+                pts_arr = np.array(pts, dtype=np.float64)
+                pts_arr[:, 1] += args.top_vertex_dy
+                el.attrib['points'] = ' '.join(f"{x:.6f},{y:.6f}" for x, y in pts_arr)
+        new_stim_root = moved_root
+    warped_svg_root = warp_svgcomp_paths(svgcomp_root, src_pts, dst_pts, args.sigma_xy, args.sigma_z, depth_map=depth_map, depth_weight=args.depth_weight)
 
     disp = dst_pts - src_pts
     mag = np.linalg.norm(disp, axis=1)
@@ -427,9 +438,8 @@ def main() -> None:
         raise RuntimeError(f'Unexpected depth model fallback: {depth_model_name}')
     print(f"[INFO] depth_model={depth_model_name}")
     print(f"[INFO] depth_image={image_path}")
-    print(f"[INFO] scale={args.scale}, translate=({args.translate_x}, {args.translate_y}), rotate_deg={args.rotate_deg}, sigma_xy={args.sigma_xy}, sigma_z={args.sigma_z}, xyz_field=pure")
+    print(f"[INFO] scale={args.scale}, translate=({args.translate_x}, {args.translate_y}), rotate_deg={args.rotate_deg}, top_vertex_dy={args.top_vertex_dy}, sigma_xy={args.sigma_xy}, sigma_z={args.sigma_z}, xyz_field=pure, field_mode=sum_of_anchor_fields")
     print(f"[INFO] anchors={len(src_pts)}, disp_mag_min={mag.min():.4f}, disp_mag_max={mag.max():.4f}, disp_mag_mean={mag.mean():.4f}")
-    print(f"[INFO] anchor_attenuation_min={anchor_attenuation.min():.4f}, anchor_attenuation_max={anchor_attenuation.max():.4f}")
 
     old_stim_path = args.output_dir / "stimulus_original.svg"
     new_stim_path = args.output_dir / "stimulus_affined.svg"
