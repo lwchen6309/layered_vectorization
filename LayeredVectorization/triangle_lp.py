@@ -1,6 +1,104 @@
 import numpy as np
 from scipy.optimize import linprog
 
+import matplotlib.pyplot as plt
+from matplotlib.patches import Polygon as MplPolygon
+
+
+def plot_stack_result(
+    polygons,
+    displacements,
+    output_path="triangle_stack_lp_output.png",
+):
+    """
+    Plot original polygons and LP-displaced polygons.
+
+    Dashed lines:
+        original polygons
+
+    Solid lines:
+        polygons after LP displacement
+    """
+
+    moved_polygons = [
+        P + d for P, d in zip(polygons, displacements)
+    ]
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    for i, P in enumerate(polygons, start=1):
+        patch = MplPolygon(
+            P,
+            closed=True,
+            fill=False,
+            linestyle="--",
+            linewidth=1.2,
+            label="Original" if i == 1 else None,
+        )
+        ax.add_patch(patch)
+
+    for i, P in enumerate(moved_polygons, start=1):
+        patch = MplPolygon(
+            P,
+            closed=True,
+            fill=False,
+            linewidth=2.0,
+            label="After LP displacement" if i == 1 else None,
+        )
+        ax.add_patch(patch)
+
+        center = P.mean(axis=0)
+        ax.text(
+            center[0],
+            center[1],
+            f"B{i}",
+            ha="center",
+            va="center",
+        )
+
+    for P, d in zip(polygons, displacements):
+        c0 = P.mean(axis=0)
+        c1 = c0 + d
+        ax.annotate(
+            "",
+            xy=c1,
+            xytext=c0,
+            arrowprops=dict(
+                arrowstyle="->",
+                linewidth=1.2,
+            ),
+        )
+
+    all_points = np.vstack(polygons + moved_polygons)
+    pad = 1.0
+    ax.set_xlim(all_points[:, 0].min() - pad, all_points[:, 0].max() + pad)
+    ax.set_ylim(all_points[:, 1].min() - pad, all_points[:, 1].max() + pad)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_title("2D Polygon Stacking LP")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.grid(True)
+    ax.legend()
+
+    plt.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.show()
+
+    print(f"Saved figure to: {output_path}")
+
+
+def make_equilateral_triangle(width):
+    """
+    Create an upright equilateral triangle centered at the origin.
+    Vertices are in counter-clockwise order.
+    """
+    h = width * np.sqrt(3) / 2
+
+    return np.array([
+        [-width / 2, -h / 3],
+        [ width / 2, -h / 3],
+        [0.0,        2 * h / 3],
+    ], dtype=float)
+
 
 def polygon_to_halfspace_ccw(P):
     """
@@ -16,11 +114,14 @@ def polygon_to_halfspace_ccw(P):
     b = []
 
     n = len(P)
+
     for i in range(n):
         p = P[i]
         q = P[(i + 1) % n]
+
         edge = q - p
         a = np.array([edge[1], -edge[0]])
+
         A.append(a)
         b.append(a @ p)
 
@@ -46,6 +147,7 @@ def solve_stack_lp(polygons, top_displacement):
             array of shape (N, 2)
             displacement of each polygon
     """
+
     N = len(polygons)
 
     num_d_vars = 2 * N
@@ -57,6 +159,7 @@ def solve_stack_lp(polygons, top_displacement):
 
     A_ub = []
     b_ub = []
+
     A_eq = []
     b_eq = []
 
@@ -65,16 +168,19 @@ def solve_stack_lp(polygons, top_displacement):
     for i in range(1, N):
         child = polygons[i]
         A_parent, b_parent = halfspaces[i - 1]
+
         for v in child:
             rhs = b_parent - A_parent @ v
+
             for a, r in zip(A_parent, rhs):
                 row = np.zeros(num_vars)
-                row[2 * i: 2 * i + 2] += a
-                row[2 * (i - 1): 2 * (i - 1) + 2] -= a
+                row[2 * i : 2 * i + 2] += a
+                row[2 * (i - 1) : 2 * (i - 1) + 2] -= a
                 A_ub.append(row)
                 b_ub.append(r)
 
     top_idx = N - 1
+
     row = np.zeros(num_vars)
     row[2 * top_idx] = 1.0
     A_eq.append(row)
@@ -117,4 +223,22 @@ def solve_stack_lp(polygons, top_displacement):
     if not result.success:
         raise RuntimeError(result.message)
 
-    return result.x[:num_d_vars].reshape(N, 2)
+    displacements = result.x[:num_d_vars].reshape(N, 2)
+    return displacements
+
+
+if __name__ == "__main__":
+    widths = [10, 8, 6, 4, 2]
+    polygons = [make_equilateral_triangle(w) for w in widths]
+    top_displacement = np.array([3.0, 0.0])
+    displacements = solve_stack_lp(polygons, top_displacement)
+
+    print("Solved displacements:")
+    for i, d in enumerate(displacements, start=1):
+        print(f"Block {i}: dx = {d[0]:.4f}, dy = {d[1]:.4f}")
+
+    plot_stack_result(
+        polygons,
+        displacements,
+        output_path="triangle_stack_lp_output.png",
+    )
