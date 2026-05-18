@@ -45,6 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--depth-weight", type=float, default=1.0, help="Legacy compatibility knob; keep at 1.0 for pure (x, y, z) field.")
     parser.add_argument("--grid", type=int, default=300, help="Preview raster size for 2x2 plot.")
     parser.add_argument("--field-grid-step", type=int, default=24, help="Sampling step for full vector-field debug plot.")
+    parser.add_argument("--depth-model", type=str, default="depth-anything/Depth-Anything-V2-Small-hf", help="Depth model override; defaults to Depth Anything V2 Small.")
     parser.add_argument("--run-inpaint", action="store_true", help="Run SDXL inpainting on uncovered regions after deformation.")
     parser.add_argument("--inpaint-model", type=str, default="diffusers/stable-diffusion-xl-1.0-inpainting-0.1", help="SDXL inpainting model id.")
     parser.add_argument("--inpaint-prompt", type=str, default="clean natural continuation background", help="Prompt for filling uncovered background regions.")
@@ -352,7 +353,7 @@ def main() -> None:
     if image_path is None:
         raise FileNotFoundError(f'Could not find source image for depth estimation next to {args.svgcomp}')
     image_pil = Image.open(image_path).convert('RGB')
-    depth_bundle, depth_model_name = _load_depth_estimator(device='cuda:0')
+    depth_bundle, depth_model_name = _load_depth_estimator(model_name=args.depth_model, device='cuda:0')
     depth_map = _run_depth_estimation(depth_bundle, image_pil, device='cuda:0')
 
     new_stim_root = update_stimulus_svg(copy.deepcopy(stim_root), args.scale, translate, args.rotate_deg)
