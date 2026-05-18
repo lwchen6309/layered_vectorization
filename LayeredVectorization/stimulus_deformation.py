@@ -45,6 +45,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--depth-weight", type=float, default=1.0, help="Legacy compatibility knob; keep at 1.0 for pure (x, y, z) field.")
     parser.add_argument("--grid", type=int, default=300, help="Preview raster size for 2x2 plot.")
     parser.add_argument("--field-grid-step", type=int, default=24, help="Sampling step for full vector-field debug plot.")
+    parser.add_argument("--neighbor-threshold", type=float, default=40.0, help="If anchors are closer than this, reduce their field influence.")
+    parser.add_argument("--min-anchor-attenuation", type=float, default=0.35, help="Minimum attenuation applied to dense/nearby anchors.")
     parser.add_argument("--depth-model", type=str, default="depth-anything/Depth-Anything-V2-Small-hf", help="Depth model to use; keep on Depth Anything V2 Small unless explicitly testing another V2 checkpoint.")
     parser.add_argument("--run-inpaint", action="store_true", help="Run SDXL inpainting on uncovered regions after deformation. Off by default.")
     parser.add_argument("--inpaint-model", type=str, default="diffusers/stable-diffusion-xl-1.0-inpainting-0.1", help="SDXL inpainting model id.")
@@ -153,7 +155,18 @@ def sample_depth_at_points(depth_map: np.ndarray, points: np.ndarray) -> np.ndar
     return depth_map[ys, xs]
 
 
-def gaussian_field_displacement(query_points: np.ndarray, src_points: np.ndarray, dst_points: np.ndarray, sigma_xy: float, sigma_z: float, query_depth: np.ndarray | None = None, src_depth: np.ndarray | None = None, depth_weight: float = 1.0) -> np.ndarray:
+def compute_anchor_attenuation(src_points: np.ndarray, neighbor_threshold: float, min_anchor_attenuation: float) -> np.ndarray:
+    n = src_points.shape[0]
+    if n <= 1:
+        return np.ones((n,), dtype=np.float64)
+    dmat = np.linalg.norm(src_points[:, None, :] - src_points[None, :, :], axis=2)
+    dmat[dmat == 0] = np.inf
+    nn = dmat.min(axis=1)
+    att = np.clip(nn / max(neighbor_threshold, 1e-8), min_anchor_attenuation, 1.0)
+    return att
+
+
+def gaussian_field_displacement(query_points: np.ndarray, src_points: np.ndarray, dst_points: np.ndarray, sigma_xy: float, sigma_z: float, query_depth: np.ndarray | None = None, src_depth: np.ndarray | None = None, depth_weight: float = 1.0, anchor_attenuation: np.ndarray | None = None) -> np.ndarray:
     disp = dst_points - src_points  # deformation vector is computed only on stimulus in xy
     field = np.zeros_like(query_points, dtype=np.float64)
     weight_sum = np.zeros((query_points.shape[0], 1), dtype=np.float64)
@@ -171,10 +184,13 @@ def gaussian_field_displacement(query_points: np.ndarray, src_points: np.ndarray
     ], axis=1)
     sigma_vec = np.array([sigma_xy, sigma_xy, sigma_z], dtype=np.float64)
 
+    if anchor_attenuation is None:
+        anchor_attenuation = np.ones((src_xyz.shape[0],), dtype=np.float64)
+
     for i in range(src_xyz.shape[0]):
         diff = (query_xyz - src_xyz[i]) / sigma_vec
         dist2 = np.sum(diff * diff, axis=1, keepdims=True)
-        w = np.exp(-0.5 * dist2)
+        w = np.exp(-0.5 * dist2) * anchor_attenuation[i]
         field += w * disp[i]
         weight_sum += w
 
@@ -182,7 +198,7 @@ def gaussian_field_displacement(query_points: np.ndarray, src_points: np.ndarray
     return field / weight_sum
 
 
-def warp_svgcomp_paths(svg_root: ET.Element, src_pts: np.ndarray, dst_pts: np.ndarray, sigma_xy: float, sigma_z: float, depth_map: np.ndarray | None = None, depth_weight: float = 1.0) -> ET.Element:
+def warp_svgcomp_paths(svg_root: ET.Element, src_pts: np.ndarray, dst_pts: np.ndarray, sigma_xy: float, sigma_z: float, depth_map: np.ndarray | None = None, depth_weight: float = 1.0, anchor_attenuation: np.ndarray | None = None) -> ET.Element:
     # Note: anchors come only from the stimulus. svgcomp contributes only query points to be warped.
     warped = copy.deepcopy(svg_root)
     src_depth = sample_depth_at_points(depth_map, src_pts) if depth_map is not None else None
@@ -197,7 +213,7 @@ def warp_svgcomp_paths(svg_root: ET.Element, src_pts: np.ndarray, dst_pts: np.nd
             continue
         pts = np.array(numbers, dtype=np.float64).reshape(-1, 2)
         query_depth = sample_depth_at_points(depth_map, pts) if depth_map is not None else None
-        disp = gaussian_field_displacement(pts, src_pts, dst_pts, sigma_xy, sigma_z, query_depth=query_depth, src_depth=src_depth, depth_weight=depth_weight)
+        disp = gaussian_field_displacement(pts, src_pts, dst_pts, sigma_xy, sigma_z, query_depth=query_depth, src_depth=src_depth, depth_weight=depth_weight, anchor_attenuation=anchor_attenuation)
         pts_warped = pts + disp
         replacement_vals = pts_warped.reshape(-1)
         idx = 0
@@ -354,14 +370,20 @@ def save_anchor_debug(src_pts: np.ndarray, dst_pts: np.ndarray, depth_map: np.nd
     u = disp[:, 0].reshape(len(ys), len(xs))
     v = disp[:, 1].reshape(len(ys), len(xs))
 
+    src_center = src_pts.mean(axis=0)
+    dst_center = dst_pts.mean(axis=0)
+
     fig, ax = plt.subplots(figsize=(7, 7))
-    ax.quiver(xx, yy, u, v, color='black', angles='xy', scale_units='xy', scale=1.0, width=0.0025)
-    ax.scatter(src_pts[:, 0], src_pts[:, 1], c='red', s=18, label='stim anchors')
+    ax.quiver(xx, yy, u, v, color='black', angles='xy', scale_units='xy', scale=1.0, width=0.0025, alpha=0.8)
+    ax.scatter(src_pts[:, 0], src_pts[:, 1], c='tab:blue', s=22, label='old stim anchors')
+    ax.scatter(dst_pts[:, 0], dst_pts[:, 1], c='tab:red', s=22, label='new stim anchors')
+    ax.scatter([src_center[0]], [src_center[1]], c='tab:blue', s=120, marker='x', linewidths=2.5, label='old stim center')
+    ax.scatter([dst_center[0]], [dst_center[1]], c='tab:red', s=120, marker='x', linewidths=2.5, label='new stim center')
     ax.set_xlim(0, width)
     ax.set_ylim(height, 0)
     ax.set_aspect('equal')
     ax.legend(loc='upper right')
-    ax.set_title('vector field arrows')
+    ax.set_title('vector field + old/new stimulus anchors')
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=200)
     plt.close(fig)
@@ -381,6 +403,7 @@ def main() -> None:
     center = np.array([width / 2.0, height / 2.0], dtype=np.float64)
     translate = np.array([args.translate_x, args.translate_y], dtype=np.float64)
     dst_pts = affine_transform_points(src_pts, center, args.scale, translate, args.rotate_deg)
+    anchor_attenuation = compute_anchor_attenuation(src_pts, args.neighbor_threshold, args.min_anchor_attenuation)
 
     candidate_images = [
         args.svgcomp.with_name('svgcomp.jpg'),
@@ -396,7 +419,7 @@ def main() -> None:
     depth_map = _run_depth_estimation(depth_bundle, image_pil, device='cuda:0')
 
     new_stim_root = update_stimulus_svg(copy.deepcopy(stim_root), args.scale, translate, args.rotate_deg)
-    warped_svg_root = warp_svgcomp_paths(svgcomp_root, src_pts, dst_pts, args.sigma_xy, args.sigma_z, depth_map=depth_map, depth_weight=args.depth_weight)
+    warped_svg_root = warp_svgcomp_paths(svgcomp_root, src_pts, dst_pts, args.sigma_xy, args.sigma_z, depth_map=depth_map, depth_weight=args.depth_weight, anchor_attenuation=anchor_attenuation)
 
     disp = dst_pts - src_pts
     mag = np.linalg.norm(disp, axis=1)
@@ -406,6 +429,7 @@ def main() -> None:
     print(f"[INFO] depth_image={image_path}")
     print(f"[INFO] scale={args.scale}, translate=({args.translate_x}, {args.translate_y}), rotate_deg={args.rotate_deg}, sigma_xy={args.sigma_xy}, sigma_z={args.sigma_z}, xyz_field=pure")
     print(f"[INFO] anchors={len(src_pts)}, disp_mag_min={mag.min():.4f}, disp_mag_max={mag.max():.4f}, disp_mag_mean={mag.mean():.4f}")
+    print(f"[INFO] anchor_attenuation_min={anchor_attenuation.min():.4f}, anchor_attenuation_max={anchor_attenuation.max():.4f}")
 
     old_stim_path = args.output_dir / "stimulus_original.svg"
     new_stim_path = args.output_dir / "stimulus_affined.svg"
