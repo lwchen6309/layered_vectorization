@@ -42,8 +42,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rotate-deg", type=float, default=0.0, help="Rotation in degrees applied around stimulus center.")
     parser.add_argument("--sigma-xy", type=float, default=12.0, help="Gaussian sigma for x/y in stimulus canvas coordinates.")
     parser.add_argument("--sigma-z", type=float, default=5.0, help="Gaussian sigma for z/depth channel after depth scaling.")
-    parser.add_argument("--depth-weight", type=float, default=120.0, help="Scale factor for depth channel when building the Gaussian field in (x, y, z) space.")
+    parser.add_argument("--depth-weight", type=float, default=1.0, help="Legacy compatibility knob; keep at 1.0 for pure (x, y, z) field.")
     parser.add_argument("--grid", type=int, default=300, help="Preview raster size for 2x2 plot.")
+    parser.add_argument("--field-grid-step", type=int, default=24, help="Sampling step for full vector-field debug plot.")
     parser.add_argument("--run-inpaint", action="store_true", help="Run SDXL inpainting on uncovered regions after deformation.")
     parser.add_argument("--inpaint-model", type=str, default="diffusers/stable-diffusion-xl-1.0-inpainting-0.1", help="SDXL inpainting model id.")
     parser.add_argument("--inpaint-prompt", type=str, default="clean natural continuation background", help="Prompt for filling uncovered background regions.")
@@ -152,20 +153,30 @@ def sample_depth_at_points(depth_map: np.ndarray, points: np.ndarray) -> np.ndar
 
 
 def gaussian_field_displacement(query_points: np.ndarray, src_points: np.ndarray, dst_points: np.ndarray, sigma_xy: float, sigma_z: float, query_depth: np.ndarray | None = None, src_depth: np.ndarray | None = None, depth_weight: float = 1.0) -> np.ndarray:
-    disp = dst_points - src_points
+    disp = dst_points - src_points  # deformation vector is computed only on stimulus in xy
     field = np.zeros_like(query_points, dtype=np.float64)
     weight_sum = np.zeros((query_points.shape[0], 1), dtype=np.float64)
-    for i in range(src_points.shape[0]):
-        diff_xy = query_points - src_points[i]
-        dist2_xy = np.sum(diff_xy * diff_xy, axis=1, keepdims=True) / (2.0 * sigma_xy * sigma_xy)
-        dist2 = dist2_xy
-        if query_depth is not None and src_depth is not None:
-            dz = (query_depth - src_depth[i]).reshape(-1, 1) * depth_weight
-            dist2_z = (dz * dz) / (2.0 * sigma_z * sigma_z)
-            dist2 = dist2 + dist2_z
-        w = np.exp(-dist2)
+
+    if query_depth is None or src_depth is None:
+        raise ValueError('Depth-aware xyz field requires both query_depth and src_depth.')
+
+    query_xyz = np.concatenate([
+        query_points,
+        query_depth.reshape(-1, 1),
+    ], axis=1)
+    src_xyz = np.concatenate([
+        src_points,
+        src_depth.reshape(-1, 1),
+    ], axis=1)
+    sigma_vec = np.array([sigma_xy, sigma_xy, sigma_z], dtype=np.float64)
+
+    for i in range(src_xyz.shape[0]):
+        diff = (query_xyz - src_xyz[i]) / sigma_vec
+        dist2 = np.sum(diff * diff, axis=1, keepdims=True)
+        w = np.exp(-0.5 * dist2)
         field += w * disp[i]
         weight_sum += w
+
     weight_sum = np.clip(weight_sum, 1e-8, None)
     return field / weight_sum
 
@@ -262,6 +273,43 @@ def run_sdxl_inpaint(image_path: Path, mask_path: Path, output_path: Path, model
     result.save(output_path)
 
 
+def save_vector_field_debug(src_pts: np.ndarray, dst_pts: np.ndarray, depth_map: np.ndarray, sigma_xy: float, sigma_z: float, depth_weight: float, canvas_size: tuple[float, float], out_path: Path, step: int = 24) -> None:
+    width, height = canvas_size
+    xs = np.arange(0, int(width), step)
+    ys = np.arange(0, int(height), step)
+    xx, yy = np.meshgrid(xs, ys)
+    query_pts = np.stack([xx.reshape(-1), yy.reshape(-1)], axis=1).astype(np.float64)
+    query_depth = sample_depth_at_points(depth_map, query_pts)
+    src_depth = sample_depth_at_points(depth_map, src_pts)
+    disp = gaussian_field_displacement(
+        query_pts,
+        src_pts,
+        dst_pts,
+        sigma_xy,
+        sigma_z,
+        query_depth=query_depth,
+        src_depth=src_depth,
+        depth_weight=depth_weight,
+    )
+    mag = np.linalg.norm(disp, axis=1).reshape(len(ys), len(xs))
+    u = disp[:, 0].reshape(len(ys), len(xs))
+    v = disp[:, 1].reshape(len(ys), len(xs))
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+    im = ax.imshow(mag, extent=[0, width, height, 0], cmap='viridis', alpha=0.9)
+    ax.quiver(xx, yy, u, v, color='white', angles='xy', scale_units='xy', scale=1.0, width=0.003)
+    ax.scatter(src_pts[:, 0], src_pts[:, 1], c='red', s=18, label='stim anchors')
+    ax.set_xlim(0, width)
+    ax.set_ylim(height, 0)
+    ax.set_aspect('equal')
+    ax.set_title('vector field magnitude + direction')
+    ax.legend(loc='upper right')
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='|displacement|')
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+
 def save_anchor_debug(src_pts: np.ndarray, dst_pts: np.ndarray, canvas_size: tuple[float, float], out_path: Path) -> None:
     width, height = canvas_size
     fig, ax = plt.subplots(figsize=(6, 6))
@@ -314,7 +362,7 @@ def main() -> None:
     mag = np.linalg.norm(disp, axis=1)
     print(f"[INFO] depth_model={depth_model_name}")
     print(f"[INFO] depth_image={image_path}")
-    print(f"[INFO] scale={args.scale}, translate=({args.translate_x}, {args.translate_y}), rotate_deg={args.rotate_deg}, sigma_xy={args.sigma_xy}, sigma_z={args.sigma_z}, depth_weight={args.depth_weight}")
+    print(f"[INFO] scale={args.scale}, translate=({args.translate_x}, {args.translate_y}), rotate_deg={args.rotate_deg}, sigma_xy={args.sigma_xy}, sigma_z={args.sigma_z}, xyz_field=pure")
     print(f"[INFO] anchors={len(src_pts)}, disp_mag_min={mag.min():.4f}, disp_mag_max={mag.max():.4f}, disp_mag_mean={mag.mean():.4f}")
 
     old_stim_path = args.output_dir / "stimulus_original.svg"
@@ -323,6 +371,7 @@ def main() -> None:
     new_svg_path = args.output_dir / "svgcomp_warped.svg"
     plot_path = args.output_dir / "stimulus_deformation_grid.png"
     anchor_debug_path = args.output_dir / "stimulus_anchor_debug.png"
+    field_debug_path = args.output_dir / "vector_field_debug.png"
     depth_gray_path = args.output_dir / "depth_map_gray.png"
     depth_inferno_path = args.output_dir / "depth_map_inferno.png"
     uncovered_mask_path = args.output_dir / "uncovered_mask.png"
@@ -341,6 +390,7 @@ def main() -> None:
     plt.close()
     make_plot(old_stim_path, new_stim_path, old_svg_path, new_svg_path, plot_path, args.grid)
     save_anchor_debug(src_pts, dst_pts, (width, height), anchor_debug_path)
+    save_vector_field_debug(src_pts, dst_pts, depth_map, args.sigma_xy, args.sigma_z, args.depth_weight, (width, height), field_debug_path, step=args.field_grid_step)
     build_uncovered_mask(old_svg_path, new_svg_path, uncovered_mask_path, args.grid)
     if args.run_inpaint:
         warped_png_path = args.output_dir / 'svgcomp_warped_for_inpaint.png'
@@ -362,6 +412,7 @@ def main() -> None:
     print(f"[OK] wrote: {new_svg_path}")
     print(f"[OK] wrote: {plot_path}")
     print(f"[OK] wrote: {anchor_debug_path}")
+    print(f"[OK] wrote: {field_debug_path}")
     print(f"[OK] wrote: {depth_gray_path}")
     print(f"[OK] wrote: {depth_inferno_path}")
     print(f"[OK] wrote: {uncovered_mask_path}")
