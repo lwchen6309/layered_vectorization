@@ -450,6 +450,8 @@ def main() -> None:
     field_debug_path = args.output_dir / "vector_field_debug.png"
     depth_gray_path = args.output_dir / "depth_map_gray.png"
     depth_inferno_path = args.output_dir / "depth_map_inferno.png"
+    depth_inferno_colorbar_path = args.output_dir / "depth_map_inferno_with_colorbar.png"
+    depth_stats_path = args.output_dir / "depth_stats.txt"
     uncovered_mask_path = args.output_dir / "uncovered_mask.png"
     edgefill_output_path = args.output_dir / "svgcomp_warped_edgefill.png"
     inpaint_output_path = args.output_dir / "svgcomp_warped_inpainted.png"
@@ -465,6 +467,28 @@ def main() -> None:
     plt.tight_layout()
     plt.savefig(depth_inferno_path, dpi=200, bbox_inches='tight', pad_inches=0)
     plt.close()
+
+    fig, ax = plt.subplots(figsize=(6.8, 6))
+    im = ax.imshow(depth_map, cmap='inferno')
+    ax.set_title('depth map with colorbar')
+    ax.axis('off')
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label('depth value')
+    fig.tight_layout()
+    fig.savefig(depth_inferno_colorbar_path, dpi=200)
+    plt.close(fig)
+
+    stats = {
+        'min': float(depth_map.min()),
+        'max': float(depth_map.max()),
+        'mean': float(depth_map.mean()),
+        'p05': float(np.percentile(depth_map, 5)),
+        'p50': float(np.percentile(depth_map, 50)),
+        'p95': float(np.percentile(depth_map, 95)),
+    }
+    with open(depth_stats_path, 'w') as f:
+        for k, v in stats.items():
+            f.write(f"{k}: {v:.6f}\n")
     make_plot(old_stim_path, new_stim_path, old_svg_path, new_svg_path, plot_path, args.grid)
     save_anchor_debug(src_pts, dst_pts, depth_map, args.sigma_xy, args.sigma_z, args.depth_weight, (width, height), anchor_debug_path, step=args.field_grid_step)
     save_vector_field_debug(src_pts, dst_pts, depth_map, args.sigma_xy, args.sigma_z, args.depth_weight, (width, height), field_debug_path, step=args.field_grid_step)
@@ -493,6 +517,8 @@ def main() -> None:
     print(f"[OK] wrote: {field_debug_path}")
     print(f"[OK] wrote: {depth_gray_path}")
     print(f"[OK] wrote: {depth_inferno_path}")
+    print(f"[OK] wrote: {depth_inferno_colorbar_path}")
+    print(f"[OK] wrote: {depth_stats_path}")
     print(f"[OK] wrote: {uncovered_mask_path}")
     print(f"[OK] wrote: {edgefill_output_path}")
     if args.run_inpaint:
