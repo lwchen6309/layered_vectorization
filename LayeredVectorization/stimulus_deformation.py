@@ -8,7 +8,7 @@ from typing import List, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 import cairosvg
 import io
 import torch
@@ -40,13 +40,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--translate-x", type=float, default=0.0, help="Translation in x applied after scaling.")
     parser.add_argument("--translate-y", type=float, default=0.0, help="Translation in y applied after scaling.")
     parser.add_argument("--rotate-deg", type=float, default=0.0, help="Rotation in degrees applied around stimulus center.")
-    parser.add_argument("--sigma-xy", type=float, default=12.0, help="Gaussian sigma for x/y in stimulus canvas coordinates.")
-    parser.add_argument("--sigma-z", type=float, default=5.0, help="Gaussian sigma for z/depth channel after depth scaling.")
+    parser.add_argument("--sigma-xy", type=float, default=6.0, help="Gaussian sigma for x/y in stimulus canvas coordinates.")
+    parser.add_argument("--sigma-z", type=float, default=0.3, help="Gaussian sigma for z/depth channel.")
     parser.add_argument("--depth-weight", type=float, default=1.0, help="Legacy compatibility knob; keep at 1.0 for pure (x, y, z) field.")
     parser.add_argument("--grid", type=int, default=300, help="Preview raster size for 2x2 plot.")
     parser.add_argument("--field-grid-step", type=int, default=24, help="Sampling step for full vector-field debug plot.")
     parser.add_argument("--depth-model", type=str, default="depth-anything/Depth-Anything-V2-Small-hf", help="Depth model override; defaults to Depth Anything V2 Small.")
-    parser.add_argument("--run-inpaint", action="store_true", help="Run SDXL inpainting on uncovered regions after deformation.")
+    parser.add_argument("--run-inpaint", action="store_true", help="Run SDXL inpainting on uncovered regions after deformation. Off by default.")
     parser.add_argument("--inpaint-model", type=str, default="diffusers/stable-diffusion-xl-1.0-inpainting-0.1", help="SDXL inpainting model id.")
     parser.add_argument("--inpaint-prompt", type=str, default="clean natural continuation background", help="Prompt for filling uncovered background regions.")
     parser.add_argument("--inpaint-steps", type=int, default=30)
@@ -253,6 +253,28 @@ def build_uncovered_mask(original_svg: Path, warped_svg: Path, out_mask: Path, s
     return mask_img
 
 
+def fill_uncovered_with_edge_color(warped_svg: Path, uncovered_mask: Path, output_path: Path, size: int) -> None:
+    img = rasterize_svg(warped_svg, size, keep_alpha=False).convert('RGB')
+    mask = Image.open(uncovered_mask).convert('L')
+
+    mask_np = np.array(mask)
+    img_np = np.array(img).astype(np.float32)
+
+    dilated = np.array(mask.filter(ImageFilter.MaxFilter(5))) > 0
+    original = mask_np > 0
+    ring = np.logical_and(dilated, np.logical_not(original))
+
+    if ring.any():
+        ring_colors = img_np[ring]
+        mean_color = np.clip(ring_colors.mean(axis=0), 0, 255).astype(np.uint8)
+    else:
+        mean_color = np.array([255, 255, 255], dtype=np.uint8)
+
+    filled = img_np.copy().astype(np.uint8)
+    filled[original] = mean_color
+    Image.fromarray(filled, mode='RGB').save(output_path)
+
+
 def run_sdxl_inpaint(image_path: Path, mask_path: Path, output_path: Path, model_id: str, prompt: str, steps: int, guidance: float, strength: float) -> None:
     image = Image.open(image_path).convert('RGB')
     mask = Image.open(mask_path).convert('L')
@@ -311,18 +333,35 @@ def save_vector_field_debug(src_pts: np.ndarray, dst_pts: np.ndarray, depth_map:
     plt.close(fig)
 
 
-def save_anchor_debug(src_pts: np.ndarray, dst_pts: np.ndarray, canvas_size: tuple[float, float], out_path: Path) -> None:
+def save_anchor_debug(src_pts: np.ndarray, dst_pts: np.ndarray, depth_map: np.ndarray, sigma_xy: float, sigma_z: float, depth_weight: float, canvas_size: tuple[float, float], out_path: Path, step: int = 24) -> None:
     width, height = canvas_size
-    fig, ax = plt.subplots(figsize=(6, 6))
-    ax.scatter(src_pts[:, 0], src_pts[:, 1], c='tab:blue', label='src anchors')
-    ax.scatter(dst_pts[:, 0], dst_pts[:, 1], c='tab:red', label='dst anchors')
-    for s, d in zip(src_pts, dst_pts):
-        ax.arrow(s[0], s[1], d[0] - s[0], d[1] - s[1], head_width=4, head_length=6, fc='gray', ec='gray', alpha=0.7)
+    xs = np.arange(0, int(width), step)
+    ys = np.arange(0, int(height), step)
+    xx, yy = np.meshgrid(xs, ys)
+    query_pts = np.stack([xx.reshape(-1), yy.reshape(-1)], axis=1).astype(np.float64)
+    query_depth = sample_depth_at_points(depth_map, query_pts)
+    src_depth = sample_depth_at_points(depth_map, src_pts)
+    disp = gaussian_field_displacement(
+        query_pts,
+        src_pts,
+        dst_pts,
+        sigma_xy,
+        sigma_z,
+        query_depth=query_depth,
+        src_depth=src_depth,
+        depth_weight=depth_weight,
+    )
+    u = disp[:, 0].reshape(len(ys), len(xs))
+    v = disp[:, 1].reshape(len(ys), len(xs))
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+    ax.quiver(xx, yy, u, v, color='black', angles='xy', scale_units='xy', scale=1.0, width=0.0025)
+    ax.scatter(src_pts[:, 0], src_pts[:, 1], c='red', s=18, label='stim anchors')
     ax.set_xlim(0, width)
     ax.set_ylim(height, 0)
     ax.set_aspect('equal')
-    ax.legend()
-    ax.set_title('stimulus anchor displacement')
+    ax.legend(loc='upper right')
+    ax.set_title('vector field arrows')
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=200)
     plt.close(fig)
@@ -376,6 +415,7 @@ def main() -> None:
     depth_gray_path = args.output_dir / "depth_map_gray.png"
     depth_inferno_path = args.output_dir / "depth_map_inferno.png"
     uncovered_mask_path = args.output_dir / "uncovered_mask.png"
+    edgefill_output_path = args.output_dir / "svgcomp_warped_edgefill.png"
     inpaint_output_path = args.output_dir / "svgcomp_warped_inpainted.png"
 
     save_svg(old_stim_root, old_stim_path)
@@ -390,9 +430,10 @@ def main() -> None:
     plt.savefig(depth_inferno_path, dpi=200, bbox_inches='tight', pad_inches=0)
     plt.close()
     make_plot(old_stim_path, new_stim_path, old_svg_path, new_svg_path, plot_path, args.grid)
-    save_anchor_debug(src_pts, dst_pts, (width, height), anchor_debug_path)
+    save_anchor_debug(src_pts, dst_pts, depth_map, args.sigma_xy, args.sigma_z, args.depth_weight, (width, height), anchor_debug_path, step=args.field_grid_step)
     save_vector_field_debug(src_pts, dst_pts, depth_map, args.sigma_xy, args.sigma_z, args.depth_weight, (width, height), field_debug_path, step=args.field_grid_step)
     build_uncovered_mask(old_svg_path, new_svg_path, uncovered_mask_path, args.grid)
+    fill_uncovered_with_edge_color(new_svg_path, uncovered_mask_path, edgefill_output_path, args.grid)
     if args.run_inpaint:
         warped_png_path = args.output_dir / 'svgcomp_warped_for_inpaint.png'
         rasterize_svg(new_svg_path, args.grid).save(warped_png_path)
@@ -417,6 +458,7 @@ def main() -> None:
     print(f"[OK] wrote: {depth_gray_path}")
     print(f"[OK] wrote: {depth_inferno_path}")
     print(f"[OK] wrote: {uncovered_mask_path}")
+    print(f"[OK] wrote: {edgefill_output_path}")
     if args.run_inpaint:
         print(f"[OK] wrote: {inpaint_output_path}")
 
