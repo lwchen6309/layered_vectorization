@@ -1,5 +1,6 @@
 import argparse
 import copy
+import json
 import math
 import re
 import xml.etree.ElementTree as ET
@@ -14,6 +15,7 @@ import io
 import torch
 from diffusers import AutoPipelineForInpainting
 from depth_main import _load_depth_estimator, _run_depth_estimation
+from triangle_lp import polygon_to_halfspace_ccw
 
 SVG_NS = "{http://www.w3.org/2000/svg}"
 NUMBER_RE = re.compile(r"[-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?")
@@ -48,6 +50,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--field-grid-step", type=int, default=24, help="Sampling step for full vector-field debug plot.")
     parser.add_argument("--depth-model", type=str, default="depth-anything/Depth-Anything-V2-Small-hf", help="Depth model to use; keep on Depth Anything V2 Small unless explicitly testing another V2 checkpoint.")
     parser.add_argument("--run-inpaint", action="store_true", help="Run SDXL inpainting on uncovered regions after deformation. Off by default.")
+    parser.add_argument("--topology-tree-json", type=Path, default=None, help="Optional precomputed topology_tree.json for tree-aware deformation.")
+    parser.add_argument("--use-tree-lp", action="store_true", help="Use tree-aware control-point deformation instead of direct pointwise warp.")
     parser.add_argument("--inpaint-model", type=str, default="diffusers/stable-diffusion-xl-1.0-inpainting-0.1", help="SDXL inpainting model id.")
     parser.add_argument("--inpaint-prompt", type=str, default="clean natural continuation background", help="Prompt for filling uncovered background regions.")
     parser.add_argument("--inpaint-steps", type=int, default=30)
@@ -176,6 +180,80 @@ def gaussian_field_displacement(query_points: np.ndarray, src_points: np.ndarray
     disp_expanded = disp[None, :, :]            # (1, A, 2)
     field = np.sum(weights * disp_expanded, axis=1)
     return field
+
+
+def extract_path_polygons(svg_root: ET.Element) -> list[np.ndarray]:
+    polygons = []
+    for path_el in svg_root.iter():
+        if path_el.tag != f"{SVG_NS}path":
+            continue
+        d = path_el.attrib.get("d")
+        if not d:
+            continue
+        numbers = [float(m.group(0)) for m in NUMBER_RE.finditer(d)]
+        if len(numbers) < 6 or len(numbers) % 2 != 0:
+            continue
+        pts = np.array(numbers, dtype=np.float64).reshape(-1, 2)
+        polygons.append(pts)
+    return polygons
+
+
+def load_topology_parent_map(topology_tree_json: Path, expected_nodes: int) -> list[int | None]:
+    payload = json.loads(topology_tree_json.read_text())
+    parent = [None] * expected_nodes
+    for node in payload:
+        idx = int(node["index"])
+        if 0 <= idx < expected_nodes:
+            parent[idx] = node.get("parent")
+    return parent
+
+
+def solve_tree_field_translations(polygons: list[np.ndarray], parent: list[int | None], field_targets: list[np.ndarray]) -> list[np.ndarray]:
+    n = len(polygons)
+    root_nodes = [i for i, p in enumerate(parent) if p is None]
+    translations = [np.zeros(2, dtype=np.float64) for _ in range(n)]
+
+    order = sorted(range(n), key=lambda i: (0 if parent[i] is None else 1, i))
+    for idx in order:
+        pidx = parent[idx]
+        target = field_targets[idx]
+        if pidx is None:
+            translations[idx] = np.zeros(2, dtype=np.float64)
+            continue
+        A_parent, b_parent = polygon_to_halfspace_ccw(polygons[pidx])
+        candidate = target.copy()
+        child = polygons[idx]
+        parent_t = translations[pidx]
+
+        violated = False
+        for v in child:
+            rel = v + candidate - parent_t
+            if np.any((A_parent @ rel) > b_parent + 1e-6):
+                violated = True
+                break
+        if not violated:
+            translations[idx] = candidate
+            continue
+
+        lo, hi = 0.0, 1.0
+        best = np.zeros(2, dtype=np.float64)
+        for _ in range(32):
+            mid = 0.5 * (lo + hi)
+            cand = mid * target
+            ok = True
+            for v in child:
+                rel = v + cand - parent_t
+                if np.any((A_parent @ rel) > b_parent + 1e-6):
+                    ok = False
+                    break
+            if ok:
+                best = cand
+                lo = mid
+            else:
+                hi = mid
+        translations[idx] = best
+
+    return translations
 
 
 def warp_svgcomp_paths(svg_root: ET.Element, src_pts: np.ndarray, dst_pts: np.ndarray, sigma_xy: float, sigma_z: float, depth_map: np.ndarray | None = None, depth_weight: float = 1.0, anchor_attenuation: np.ndarray | None = None) -> ET.Element:
@@ -430,7 +508,59 @@ def main() -> None:
                 pts_arr[:, 1] += args.top_vertex_dy
                 el.attrib['points'] = ' '.join(f"{x:.6f},{y:.6f}" for x, y in pts_arr)
         new_stim_root = moved_root
-    warped_svg_root = warp_svgcomp_paths(svgcomp_root, src_pts, dst_pts, args.sigma_xy, args.sigma_z, depth_map=depth_map, depth_weight=args.depth_weight)
+    if args.use_tree_lp:
+        polygons = extract_path_polygons(svgcomp_root)
+        topology_json = args.topology_tree_json
+        if topology_json is None:
+            raise ValueError('--use-tree-lp requires --topology-tree-json')
+        parent_map = load_topology_parent_map(topology_json, len(polygons))
+        src_depth = sample_depth_at_points(depth_map, src_pts)
+        field_targets = []
+        for pts in polygons:
+            query_depth = sample_depth_at_points(depth_map, pts)
+            disp = gaussian_field_displacement(
+                pts,
+                src_pts,
+                dst_pts,
+                args.sigma_xy,
+                args.sigma_z,
+                query_depth=query_depth,
+                src_depth=src_depth,
+                depth_weight=args.depth_weight,
+            )
+            field_targets.append(disp.mean(axis=0))
+
+        translations = solve_tree_field_translations(polygons, parent_map, field_targets)
+        warped_svg_root = copy.deepcopy(svgcomp_root)
+        path_counter = 0
+        for path_el in warped_svg_root.iter():
+            if path_el.tag != f"{SVG_NS}path":
+                continue
+            d = path_el.attrib.get("d")
+            if not d:
+                continue
+            numbers = [float(m.group(0)) for m in NUMBER_RE.finditer(d)]
+            if len(numbers) % 2 != 0:
+                path_counter += 1
+                continue
+            pts = np.array(numbers, dtype=np.float64).reshape(-1, 2)
+            if path_counter < len(translations):
+                pts_warped = pts + translations[path_counter]
+            else:
+                pts_warped = pts
+            replacement_vals = pts_warped.reshape(-1)
+            idx = 0
+
+            def repl(_match):
+                nonlocal idx
+                val = replacement_vals[idx]
+                idx += 1
+                return f"{val:.6f}"
+
+            path_el.attrib["d"] = NUMBER_RE.sub(repl, d)
+            path_counter += 1
+    else:
+        warped_svg_root = warp_svgcomp_paths(svgcomp_root, src_pts, dst_pts, args.sigma_xy, args.sigma_z, depth_map=depth_map, depth_weight=args.depth_weight)
 
     disp = dst_pts - src_pts
     mag = np.linalg.norm(disp, axis=1)
