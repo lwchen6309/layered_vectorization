@@ -40,12 +40,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--translate-x", type=float, default=0.0, help="Translation in x applied after scaling.")
     parser.add_argument("--translate-y", type=float, default=0.0, help="Translation in y applied after scaling.")
     parser.add_argument("--rotate-deg", type=float, default=0.0, help="Rotation in degrees applied around stimulus center.")
-    parser.add_argument("--sigma-xy", type=float, default=6.0, help="Gaussian sigma for x/y in stimulus canvas coordinates.")
+    parser.add_argument("--sigma-xy", type=float, default=12.0, help="Gaussian sigma for x/y in stimulus canvas coordinates.")
     parser.add_argument("--sigma-z", type=float, default=0.3, help="Gaussian sigma for z/depth channel.")
     parser.add_argument("--depth-weight", type=float, default=1.0, help="Legacy compatibility knob; keep at 1.0 for pure (x, y, z) field.")
     parser.add_argument("--grid", type=int, default=300, help="Preview raster size for 2x2 plot.")
     parser.add_argument("--field-grid-step", type=int, default=24, help="Sampling step for full vector-field debug plot.")
-    parser.add_argument("--depth-model", type=str, default="depth-anything/Depth-Anything-V2-Small-hf", help="Depth model override; defaults to Depth Anything V2 Small.")
+    parser.add_argument("--depth-model", type=str, default="depth-anything/Depth-Anything-V2-Small-hf", help="Depth model to use; keep on Depth Anything V2 Small unless explicitly testing another V2 checkpoint.")
     parser.add_argument("--run-inpaint", action="store_true", help="Run SDXL inpainting on uncovered regions after deformation. Off by default.")
     parser.add_argument("--inpaint-model", type=str, default="diffusers/stable-diffusion-xl-1.0-inpainting-0.1", help="SDXL inpainting model id.")
     parser.add_argument("--inpaint-prompt", type=str, default="clean natural continuation background", help="Prompt for filling uncovered background regions.")
@@ -400,6 +400,8 @@ def main() -> None:
 
     disp = dst_pts - src_pts
     mag = np.linalg.norm(disp, axis=1)
+    if depth_model_name != 'depth-anything/Depth-Anything-V2-Small-hf' and args.depth_model is None:
+        raise RuntimeError(f'Unexpected depth model fallback: {depth_model_name}')
     print(f"[INFO] depth_model={depth_model_name}")
     print(f"[INFO] depth_image={image_path}")
     print(f"[INFO] scale={args.scale}, translate=({args.translate_x}, {args.translate_y}), rotate_deg={args.rotate_deg}, sigma_xy={args.sigma_xy}, sigma_z={args.sigma_z}, xyz_field=pure")
