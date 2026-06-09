@@ -79,6 +79,15 @@ def save_aspect_fixed_svg(input_svg: str, reference_image: str, output_svg: str,
     tree.write(output_svg, encoding='utf-8', xml_declaration=True)
 
 
+def compute_psnr_from_renders(pred_img: torch.Tensor, target_img_np: np.ndarray, device: torch.device) -> float:
+    target = torch.tensor(target_img_np, device=device, dtype=torch.float32) / 255.0
+    target = target.permute(2, 0, 1)
+    mse = F.mse_loss(pred_img.float(), target.float()).item()
+    if mse <= 1e-12:
+        return float('inf')
+    return 10.0 * np.log10(1.0 / mse)
+
+
 def init_diffvg(
     device: torch.device,
     use_gpu: bool = torch.cuda.is_available(),
@@ -514,6 +523,13 @@ def layered_vectorization(
         shapes,
         shape_groups,
     )
+
+    final_render = svg_to_img(img_width, img_height, shapes, shape_groups, device)
+    final_render = rgba_to_rgb(final_render, device)
+    final_psnr = compute_psnr_from_renders(final_render, target_img, device)
+    print(f"Final PSNR: {final_psnr:.4f}")
+    with open(os.path.join(exp_dir, "metrics.txt"), "w", encoding="utf-8") as f:
+        f.write(f"PSNR={final_psnr:.6f}\n")
 
     try:
         save_aspect_fixed_svg(
