@@ -186,10 +186,14 @@ def init_struct_target_imgs(layerd_struct_masks: list):
     struct_target_imgs = []
     struct_colors_list = []
     for i,monolayer_masks in enumerate(layerd_struct_masks):
-        seg_image = 0
+        seg_image = None
         mask_colors = []
         for mask in monolayer_masks:
-            tensor0 = torch.zeros((3, 512, 512))
+            mask_image1 = transforms.ToTensor()(Image.fromarray(mask))
+            if seg_image is None:
+                _, h, w = mask_image1.shape
+                seg_image = torch.zeros((3, h, w), dtype=mask_image1.dtype)
+            tensor0 = torch.zeros_like(seg_image)
             color = []
             for channel in range(3):
                 channel_value = 0.2 + (1 - 0.2) * torch.rand(1)
@@ -197,11 +201,11 @@ def init_struct_target_imgs(layerd_struct_masks: list):
                 color.append(channel_value)
             mask_colors.append(color)
 
-            # mask_image1 = Image.open(mask)
-            mask_image1 = transforms.ToTensor()(Image.fromarray(mask))
-            seg_image += tensor0*mask_image1
+            seg_image += tensor0 * mask_image1
             seg_image = torch.clamp(seg_image, max=1.0)
 
+        if seg_image is None:
+            continue
         struct_target_imgs.append(seg_image)
         struct_colors_list.append(mask_colors)
     return struct_target_imgs, struct_colors_list

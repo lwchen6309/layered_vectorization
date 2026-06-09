@@ -1,4 +1,5 @@
 from typing import Tuple, Union, Optional, List
+import os
 import torch
 from torch.optim.sgd import SGD
 from diffusers import StableDiffusionPipeline, UNet2DConditionModel
@@ -162,33 +163,54 @@ def sds_based_simplification(
     simp_img_seq_indexs: List[int],
     simp_img_seq_save_path: str,
     all_simp_img_seq_save_path: str = "-1",
-    pipe: Optional[Union[StableDiffusionPipeline, StableDiffusionImg2ImgPipeline]] = None,  
+    pipe: Optional[Union[StableDiffusionPipeline, StableDiffusionImg2ImgPipeline]] = None,
+    preserve_aspect_ratio: bool = True,
 ):
-    """Simplify an image using SDS. Reuses pipeline if provided."""
-    image = load_512(image)
+    """Simplify an image using SDS. Reuses pipeline if provided.
+
+    If preserve_aspect_ratio is True, keeps the original image aspect ratio by
+    resizing only to multiples of 8 for VAE compatibility, then resizing SDS
+    outputs back to the original size.
+    """
+    image_pil = Image.open(image).convert("RGB")
+    orig_w, orig_h = image_pil.size
+
+    if preserve_aspect_ratio:
+        proc_w = max(8, (orig_w // 8) * 8)
+        proc_h = max(8, (orig_h // 8) * 8)
+        if (proc_w, proc_h) != (orig_w, orig_h):
+            image_np = np.array(image_pil.resize((proc_w, proc_h), Image.Resampling.LANCZOS))
+        else:
+            image_np = np.array(image_pil)
+    else:
+        image_np = load_512(image)
+
     prompt = " "
 
-    # Load pipeline only if not provided
     if pipe is None:
-        # pipe = build_sd_pipeline(model_id="runwayml/stable-diffusion-v1-5", device=device)
         model_id = "runwayml/stable-diffusion-v1-5"
-        pipeline = StableDiffusionPipeline.from_pretrained(model_id).to(device)
+        pipe = StableDiffusionPipeline.from_pretrained(model_id).to(device)
 
     num_iters = simp_img_seq_indexs[0]
-    all_simp_img_seq = image_optimization(device, pipe, image, prompt, num_iters)
+    all_simp_img_seq = image_optimization(device, pipe, image_np, prompt, num_iters)
 
-    simp_img_seq = [image]
-    image = Image.fromarray(image)
-    image.save(f"{simp_img_seq_save_path}/0.png")
+    def restore_size(arr: np.ndarray) -> np.ndarray:
+        if preserve_aspect_ratio and arr.shape[:2] != (orig_h, orig_w):
+            return np.array(Image.fromarray(arr).resize((orig_w, orig_h), Image.Resampling.LANCZOS))
+        return arr
+
+    base_img = restore_size(image_np)
+    simp_img_seq = [base_img]
+    base_img_pil = Image.fromarray(base_img)
+    base_img_pil.save(os.path.join(simp_img_seq_save_path, "0.png"))
     if all_simp_img_seq_save_path != "-1":
-        image.save(f"{all_simp_img_seq_save_path}/0.png")
+        base_img_pil.save(os.path.join(all_simp_img_seq_save_path, "0.png"))
 
     for i, simp_img in enumerate(all_simp_img_seq):
+        restored = restore_size(simp_img)
         if i + 1 in simp_img_seq_indexs:
-            simp_img_seq.append(simp_img)
-            simp_img_ = Image.fromarray(simp_img)
-            simp_img_.save(f"{simp_img_seq_save_path}/{i+1}.png")
+            simp_img_seq.append(restored)
+            Image.fromarray(restored).save(os.path.join(simp_img_seq_save_path, f"{i+1}.png"))
         if all_simp_img_seq_save_path != "-1":
-            simp_img_ = Image.fromarray(simp_img)
-            simp_img_.save(f"{all_simp_img_seq_save_path}/{i+1}.png")
+            Image.fromarray(restored).save(os.path.join(all_simp_img_seq_save_path, f"{i+1}.png"))
     return simp_img_seq
