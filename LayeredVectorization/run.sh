@@ -13,7 +13,6 @@ for npath in 16 32 64 128 256; do
   echo "=== Running npath=${npath} ==="
   CFG="${TMP_CONFIG_DIR}/${npath}_config.yaml"
   RUN_NAME="scene_${npath}"
-  RUN_DIR="${OUTPUT_ROOT}/${RUN_NAME}"
 
   python - <<PY
 from pathlib import Path
@@ -33,14 +32,4 @@ PY
     --target_image "${TARGET_IMAGE}" \
     --file_save_name "${RUN_NAME}" \
     --output_root "${OUTPUT_ROOT}"
-
-  if [ -f "${RUN_DIR}/final.svg" ]; then
-    python svg_aspect_ratio_fix.py \
-      --input-svg "${RUN_DIR}/final.svg" \
-      --reference-image "${TARGET_IMAGE}" \
-      --output-svg "${RUN_DIR}/final_aspect_fixed.svg" \
-      --square-size 512
-  else
-    echo "[warn] ${RUN_DIR}/final.svg not found; skip aspect-ratio fix"
-  fi
 done
