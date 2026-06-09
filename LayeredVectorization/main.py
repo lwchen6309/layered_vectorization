@@ -3,6 +3,9 @@ import glob
 import shutil
 import argparse
 import time
+import re
+import xml.etree.ElementTree as ET
+from pathlib import Path
 from typing import Optional, List
 
 import yaml
@@ -17,6 +20,63 @@ from diffusers import StableDiffusionPipeline
 
 from utils.img_process import *
 from sds_image_simplicity import sds_based_simplification
+
+FLOAT_RE = re.compile(r"[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?")
+
+
+def infer_square_size_from_svg(svg_path: str) -> float:
+    tree = ET.parse(svg_path)
+    root = tree.getroot()
+    vals = []
+    for path_el in root.iter():
+        if path_el.tag.endswith('path'):
+            d = path_el.get('d', '')
+            vals.extend(float(x) for x in FLOAT_RE.findall(d))
+    if not vals:
+        raise RuntimeError('No numeric path coordinates found in SVG.')
+    max_abs = max(abs(v) for v in vals)
+    candidates = []
+    for v in (root.get('width'), root.get('height')):
+        if v is None:
+            continue
+        try:
+            candidates.append(float(str(v).replace('px', '').strip()))
+        except Exception:
+            pass
+    return max(candidates) if candidates else max_abs
+
+
+def scale_path_d_for_aspect_fix(d: str, sx: float, sy: float) -> str:
+    idx = 0
+    out = []
+    coord_index = 0
+    for m in FLOAT_RE.finditer(d):
+        out.append(d[idx:m.start()])
+        val = float(m.group(0))
+        scaled = val * (sx if coord_index % 2 == 0 else sy)
+        out.append(f"{scaled:.6f}".rstrip('0').rstrip('.'))
+        idx = m.end()
+        coord_index += 1
+    out.append(d[idx:])
+    return ''.join(out)
+
+
+def save_aspect_fixed_svg(input_svg: str, reference_image: str, output_svg: str, square_size: float = 512.0):
+    tree = ET.parse(input_svg)
+    root = tree.getroot()
+    with Image.open(reference_image) as im:
+        orig_w, orig_h = im.size
+    if square_size is None:
+        square_size = infer_square_size_from_svg(input_svg)
+    sx = orig_w / float(square_size)
+    sy = orig_h / float(square_size)
+    root.set('width', str(orig_w))
+    root.set('height', str(orig_h))
+    root.set('viewBox', f'0 0 {orig_w} {orig_h}')
+    for el in root.iter():
+        if el.tag.endswith('path') and el.get('d'):
+            el.set('d', scale_path_d_for_aspect_fix(el.get('d'), sx, sy))
+    tree.write(output_svg, encoding='utf-8', xml_declaration=True)
 
 
 def init_diffvg(
@@ -446,13 +506,24 @@ def layered_vectorization(
             is_path_merging_phase=True,
         )
 
+    final_svg_path = os.path.join(exp_dir, "final.svg")
     pydiffvg.save_svg(
-        os.path.join(exp_dir, "final.svg"),
+        final_svg_path,
         img_height,
         img_width,
         shapes,
         shape_groups,
     )
+
+    try:
+        save_aspect_fixed_svg(
+            input_svg=final_svg_path,
+            reference_image=args.target_image,
+            output_svg=os.path.join(exp_dir, "final_aspect_fixed.svg"),
+            square_size=512.0,
+        )
+    except Exception as e:
+        print(f"[warn] aspect-ratio post-fix failed: {e}")
 
 
 def load_config(file_path, args):
