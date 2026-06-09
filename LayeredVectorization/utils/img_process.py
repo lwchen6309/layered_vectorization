@@ -444,7 +444,7 @@ def add_visual_paths(shapes,shape_groups,device,
         is_opt_list = [0 for i in range(len(shapes))]
 
     img_height, img_width = target_img.shape[:2]
-    raster_img = svg_to_img(img_height,img_width,shapes,shape_groups,device)
+    raster_img = svg_to_img(img_width, img_height, shapes, shape_groups, device)
     raster_img = rgba_to_rgb(raster_img,device=device)
     raster_img = raster_img.detach().cpu().numpy()
     target_img1 = np.transpose((target_img/255).astype(np.float16), (2, 0, 1))
