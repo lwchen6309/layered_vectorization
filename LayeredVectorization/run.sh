@@ -32,4 +32,14 @@ PY
     --target_image "${TARGET_IMAGE}" \
     --file_save_name "${RUN_NAME}" \
     --output_root "${OUTPUT_ROOT}"
+
+  INPUT_SVG="${OUTPUT_ROOT}/${RUN_NAME}/final.svg"
+  FIXED_SVG="${OUTPUT_ROOT}/${RUN_NAME}/final_aspect_fixed.svg"
+  OUTPUT_PNG="${OUTPUT_ROOT}/${RUN_NAME}/final_aspect_fixed.png"
+
+  python run_external_aspect_fix_and_rasterize.py \
+    --input-svg "${INPUT_SVG}" \
+    --target-image "${TARGET_IMAGE}" \
+    --fixed-svg "${FIXED_SVG}" \
+    --output-png "${OUTPUT_PNG}"
 done
