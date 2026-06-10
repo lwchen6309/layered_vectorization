@@ -35,7 +35,11 @@ def main():
     args.output_png.parent.mkdir(parents=True, exist_ok=True)
 
     # Step 1: aspect-fix externally
-    fix_svg_aspect_ratio(str(args.input_svg), str(args.fixed_svg))
+    fix_svg_aspect_ratio(
+        str(args.input_svg),
+        str(args.fixed_svg),
+        reference_image_path=str(args.target_image),
+    )
 
     # Step 2: normalize namespaced tags for downstream SVG tooling compatibility
     normalized_svg = args.normalized_svg or args.fixed_svg.with_name(args.fixed_svg.stem + '_normalized.svg')

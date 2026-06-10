@@ -57,6 +57,50 @@ def get_image_size(image_path: Path) -> Tuple[int, int]:
         return im.size
 
 
+def fix_svg_aspect_ratio(input_svg_path: str, output_svg_path: str, reference_image_path: str | None = None, square_size: float | None = None):
+    input_svg = Path(input_svg_path)
+    output_svg = Path(output_svg_path)
+    output_svg.parent.mkdir(parents=True, exist_ok=True)
+
+    tree = ET.parse(input_svg)
+    root = tree.getroot()
+
+    if reference_image_path is not None:
+        orig_w, orig_h = get_image_size(Path(reference_image_path))
+    else:
+        w = root.get('width')
+        h = root.get('height')
+        if w is None or h is None:
+            raise ValueError('reference_image_path is required when SVG width/height are unavailable.')
+        try:
+            orig_w = int(float(str(w).replace('px', '').strip()))
+            orig_h = int(float(str(h).replace('px', '').strip()))
+        except Exception as e:
+            raise ValueError('Failed to infer output width/height from SVG; provide reference_image_path.') from e
+
+    inferred_square = square_size if square_size is not None else infer_square_size(root)
+    sx = orig_w / float(inferred_square)
+    sy = orig_h / float(inferred_square)
+
+    root.set('width', str(orig_w))
+    root.set('height', str(orig_h))
+    root.set('viewBox', f'0 0 {orig_w} {orig_h}')
+
+    for el in root.iter():
+        if el.tag.endswith('path') and el.get('d'):
+            el.set('d', scale_path_d(el.get('d'), sx, sy))
+
+    tree.write(output_svg, encoding='utf-8', xml_declaration=True)
+    return {
+        'output_svg': str(output_svg),
+        'square_size': inferred_square,
+        'sx': sx,
+        'sy': sy,
+        'width': orig_w,
+        'height': orig_h,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description='Scale square SVG geometry back to original image aspect ratio.')
     parser.add_argument('--input-svg', required=True, help='Input square SVG path file')
