@@ -331,6 +331,30 @@ def combine_binary_masks(masks: list) -> np.ndarray:
     return combined
 
 
+def ensure_depth_layers_cover_canvas(layerd_struct_masks: list, out_dir: str):
+    if not layerd_struct_masks:
+        return layerd_struct_masks, 0
+
+    union_mask = np.zeros_like(layerd_struct_masks[0][0], dtype=np.uint8)
+    for masks in layerd_struct_masks:
+        union_mask = np.maximum(union_mask, combine_binary_masks(masks))
+
+    uncovered = np.where(union_mask > 0, 0, 255).astype(np.uint8)
+    os.makedirs(out_dir, exist_ok=True)
+    Image.fromarray(uncovered).save(os.path.join(out_dir, "uncovered_pixels.png"))
+    uncovered_area = int(np.sum(uncovered > 0))
+    with open(os.path.join(out_dir, "coverage.txt"), "w", encoding="utf-8") as f:
+        total_area = int(uncovered.shape[0] * uncovered.shape[1])
+        f.write(f"total_pixels={total_area}\n")
+        f.write(f"uncovered_pixels={uncovered_area}\n")
+        f.write(f"uncovered_ratio={uncovered_area / max(1, total_area):.8f}\n")
+
+    if uncovered_area > 0:
+        canvas_mask = np.ones_like(uncovered, dtype=np.uint8) * 255
+        layerd_struct_masks[0] = [canvas_mask] + layerd_struct_masks[0]
+    return layerd_struct_masks, uncovered_area
+
+
 def svg_optimize_img_struct(
     device,
     shapes,
@@ -765,6 +789,24 @@ def layered_vectorization(
                 layerd_struct_masks,
                 depth_map,
                 near_mode=getattr(args, "depth_near_mode", "large"),
+            )
+        layerd_struct_masks, uncovered_area = ensure_depth_layers_cover_canvas(
+            layerd_struct_masks,
+            os.path.join(exp_dir, "depth_ordering"),
+        )
+        if uncovered_area > 0:
+            initial_depth_order.insert(
+                0,
+                {
+                    "new_rank": -1,
+                    "new_layer": 0,
+                    "old_layer": None,
+                    "old_index": None,
+                    "depth_score": None,
+                    "area": int(img_height * img_width),
+                    "uncovered_pixels": uncovered_area,
+                    "source": "canvas_background_for_uncovered_pixels",
+                },
             )
         save_depth_layer_masks(
             layerd_struct_masks,
