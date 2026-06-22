@@ -313,7 +313,8 @@ def pixel_depth_cluster_layers(
     layer_count = int(labels.max()) + 1
     depth_layers = [(labels == layer_index).astype(np.uint8) * 255 for layer_index in range(layer_count)]
 
-    sorted_layers = [[depth_layer] for depth_layer in depth_layers]
+    path_layers = [[] for _ in range(layer_count)]
+    owner_layers = [[depth_layer] for depth_layer in depth_layers]
     order_meta = [
         {
             "new_layer": layer_index,
@@ -342,7 +343,7 @@ def pixel_depth_cluster_layers(
             area = int(np.sum(clipped > 0))
             if area <= 0:
                 continue
-            sorted_layers[layer_index].append(np.ascontiguousarray(clipped))
+            path_layers[layer_index].append(np.ascontiguousarray(clipped))
             order_meta.append(
                 {
                     "new_layer": layer_index,
@@ -354,7 +355,22 @@ def pixel_depth_cluster_layers(
                     "source": "sam_mask_clipped_to_pixel_depth_cluster",
                 }
             )
-    return sorted_layers, order_meta
+    for layer_index, masks in enumerate(path_layers):
+        if masks:
+            continue
+        path_layers[layer_index].append(np.ascontiguousarray(depth_layers[layer_index]))
+        order_meta.append(
+            {
+                "new_layer": layer_index,
+                "old_layer": None,
+                "old_index": None,
+                "raw_depth": None,
+                "depth_score": None,
+                "area": int(np.sum(depth_layers[layer_index] > 0)),
+                "source": "empty_layer_depth_cluster_fallback",
+            }
+        )
+    return path_layers, owner_layers, order_meta
 
 
 def save_depth_layer_masks(layerd_struct_masks: list, out_dir: str) -> None:
@@ -420,6 +436,7 @@ def svg_optimize_img_struct(
     file_save_path: str,
     train_conf: dict,
     base_lr_conf: dict,
+    layer_loss_masks: Optional[list] = None,
 ):
     struct_target_imgs, struct_colors_list = init_struct_target_imgs(layerd_struct_masks)
     struct_target_imgs = [x.to(device) for x in struct_target_imgs]
@@ -454,7 +471,8 @@ def svg_optimize_img_struct(
 
     if train_conf.get("three_pass_depth_layervec", train_conf.get("depth_layer_sequential_fit", False)):
         layer_ranges = get_layer_shape_ranges(layerd_struct_masks)
-        layer_masks = [mask_to_torch(combine_binary_masks(masks), device) for masks in layerd_struct_masks]
+        loss_mask_layers = layer_loss_masks if layer_loss_masks is not None else layerd_struct_masks
+        layer_masks = [mask_to_torch(combine_binary_masks(masks), device) for masks in loss_mask_layers]
         layer_num_iters = int(
             train_conf.get(
                 "three_pass_struct_num_iters",
@@ -834,7 +852,7 @@ def layered_vectorization(
         layerd_struct_masks = sanitize_layered_masks(layerd_struct_masks)
         depth_layer_grouping = getattr(args, "depth_layer_grouping", "kmeans")
         if depth_layer_grouping == "pixel_cluster":
-            layerd_struct_masks, initial_depth_order = pixel_depth_cluster_layers(
+            layerd_struct_masks, layer_loss_masks, initial_depth_order = pixel_depth_cluster_layers(
                 layerd_struct_masks,
                 depth_map,
                 near_mode=getattr(args, "depth_near_mode", "large"),
@@ -847,14 +865,16 @@ def layered_vectorization(
                 near_mode=getattr(args, "depth_near_mode", "large"),
                 num_depth_layers=int(getattr(args, "depth_num_layers", 3)),
             )
+            layer_loss_masks = layerd_struct_masks
         else:
             layerd_struct_masks, initial_depth_order = sort_layered_masks_back_to_front_by_depth(
                 layerd_struct_masks,
                 depth_map,
                 near_mode=getattr(args, "depth_near_mode", "large"),
             )
-        layerd_struct_masks, uncovered_area = ensure_depth_layers_cover_canvas(
-            layerd_struct_masks,
+            layer_loss_masks = layerd_struct_masks
+        layer_loss_masks, uncovered_area = ensure_depth_layers_cover_canvas(
+            layer_loss_masks,
             os.path.join(exp_dir, "depth_ordering"),
         )
         if uncovered_area > 0:
@@ -872,9 +892,14 @@ def layered_vectorization(
                 },
             )
         save_depth_layer_masks(
-            layerd_struct_masks,
+            layer_loss_masks,
             os.path.join(exp_dir, "depth_ordering", f"{depth_layer_grouping}_layer_masks"),
         )
+        if depth_layer_grouping == "pixel_cluster":
+            save_depth_layer_masks(
+                layerd_struct_masks,
+                os.path.join(exp_dir, "depth_ordering", "sam_clipped_layer_masks"),
+            )
         with open(os.path.join(exp_dir, "initial_depth_mask_order.json"), "w", encoding="utf-8") as f:
             json.dump(initial_depth_order, f, indent=2)
     else:
@@ -888,6 +913,7 @@ def layered_vectorization(
             int(args.max_path_num_limit * 0.4),
         )
         depth_map = None
+        layer_loss_masks = layerd_struct_masks
 
     shapes, shape_groups = init_svg_by_mask(
         layerd_struct_masks,
@@ -904,6 +930,7 @@ def layered_vectorization(
         struct_svgs_save_path,
         args.train,
         args.base_lr,
+        layer_loss_masks=layer_loss_masks,
     )
 
     if args.color_fitting_type not in ["dominan", "mse"]:
@@ -934,7 +961,7 @@ def layered_vectorization(
     count = 0
     if args.train.get("three_pass_visual_refinement", args.train.get("depth_layer_visual_refinement", False)) and depth_map is not None:
         layer_ranges = get_layer_shape_ranges(layerd_struct_masks)
-        layer_masks = [combine_binary_masks(masks) for masks in layerd_struct_masks]
+        layer_masks = [combine_binary_masks(masks) for masks in layer_loss_masks]
 
         for i in range(args.add_visual_path_num_iters):
             any_added = False
