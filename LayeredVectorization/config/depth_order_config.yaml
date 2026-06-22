@@ -30,6 +30,8 @@ train:
   is_train_stroke: False
   is_train_visual_color: True
   is_train_struct_color: True
+  depth_layer_sequential_fit: True
+  depth_layer_struct_num_iters: 50
   struct_opt_num_iters: 50
   visual_opt_num_iters: 100
 

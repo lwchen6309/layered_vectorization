@@ -52,20 +52,24 @@ def init_optimizer(
         is_opt_list = [1 for _ in range(len(shapes))]
 
     for i, path in enumerate(shapes):
-        if is_opt_list[i] == 1:
-            path.points.requires_grad = True
+        is_active = is_opt_list[i] == 1
+        path.points.requires_grad = is_active
+        if is_train_stroke:
+            path.stroke_width.requires_grad = is_active
+        if is_active:
             points_vars.append(path.points)
             if is_train_stroke:
-                path.stroke_width.requires_grad = True
                 stroke_width_vars.append(path.stroke_width)
 
     if is_train_color:
         for i, group in enumerate(shape_groups):
-            if is_opt_list[i] == 1:
-                group.fill_color.requires_grad = True
+            is_active = is_opt_list[i] == 1
+            group.fill_color.requires_grad = is_active
+            if is_train_stroke:
+                group.stroke_color.requires_grad = is_active
+            if is_active:
                 color_vars.append(group.fill_color)
                 if is_train_stroke:
-                    group.stroke_color.requires_grad = True
                     stroke_color_vars.append(group.stroke_color)
 
     params = {"point": points_vars}
@@ -298,6 +302,16 @@ def save_depth_layer_masks(layerd_struct_masks: list, out_dir: str) -> None:
         Image.fromarray(combined).save(os.path.join(out_dir, f"depth_layer_{layer_index:02d}.png"))
 
 
+def get_layer_shape_ranges(layerd_struct_masks: list) -> list:
+    ranges = []
+    start = 0
+    for masks in layerd_struct_masks:
+        end = start + len(masks)
+        ranges.append((start, end))
+        start = end
+    return ranges
+
+
 def svg_optimize_img_struct(
     device,
     shapes,
@@ -338,6 +352,91 @@ def svg_optimize_img_struct(
     img_height, img_width = target_img.shape[:2]
     target_img = torch.tensor(target_img, device=device) / 255.0
     target_img = target_img.permute(2, 0, 1)
+
+    if train_conf.get("depth_layer_sequential_fit", False):
+        layer_ranges = get_layer_shape_ranges(layerd_struct_masks)
+        layer_num_iters = int(
+            train_conf.get(
+                "depth_layer_struct_num_iters",
+                train_conf["struct_opt_num_iters"],
+            )
+        )
+        global_iter = 0
+        for struct_i, (start, end) in enumerate(layer_ranges):
+            if start == end:
+                continue
+
+            active_list = [0 for _ in range(len(shapes))]
+            for index in range(start, end):
+                active_list[index] = 1
+
+            svg_optimizer = init_optimizer(
+                shapes,
+                shape_groups,
+                train_conf["is_train_stroke"],
+                train_conf["is_train_struct_color"],
+                active_list,
+                lr_base=base_lr_conf,
+            )
+
+            cur_masks = layerd_struct_masks[struct_i]
+            with tqdm(
+                total=layer_num_iters,
+                desc=f"Struct depth layer {struct_i}",
+                unit="iter",
+            ) as pbar:
+                for _ in range(layer_num_iters):
+                    visible_shapes = shapes[:end]
+                    visible_shape_groups = shape_groups[:end]
+                    img = svg_to_img(
+                        img_width,
+                        img_height,
+                        visible_shapes,
+                        visible_shape_groups,
+                        device,
+                    )
+                    img = rgba_to_rgb(img, device, white_bg)
+                    loss_mse = F.mse_loss(img, target_img)
+
+                    struct_img = svg_to_img(
+                        img_width,
+                        img_height,
+                        shapes[start:end],
+                        struct_shape_groups_list[struct_i],
+                        device,
+                    )
+                    struct_img = rgba_to_rgb(struct_img, device, black_bg)
+                    loss_struct = F.mse_loss(struct_img, struct_target_imgs[struct_i])
+
+                    if train_conf.get("disable_exclude_loss", False):
+                        loss_exclude = 0
+                    else:
+                        transparent_img = svg_to_img(
+                            img_width,
+                            img_height,
+                            shapes[start:end],
+                            transparent_shape_groups[:len(cur_masks)],
+                            device,
+                        )
+                        transparent_img = rgba_to_rgb(transparent_img, device, white_bg)
+                        loss_exclude = exclude_loss(transparent_img, scale=2e-7)
+
+                    loss = loss_mse * 0.02 + loss_exclude + loss_struct
+                    svg_optimizer.zero_grad()
+                    loss.backward()
+                    svg_optimizer.step()
+
+                    pydiffvg.save_svg(
+                        os.path.join(file_save_path, f"{global_iter}.svg"),
+                        img_width,
+                        img_height,
+                        shapes,
+                        shape_groups,
+                    )
+                    global_iter += 1
+                    pbar.update(1)
+
+        return shapes, shape_groups
 
     svg_optimizer = init_optimizer(
         shapes,
