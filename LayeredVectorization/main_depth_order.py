@@ -792,8 +792,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--depth_layer_grouping",
         choices=["kmeans", "sort"],
-        default="kmeans",
-        help="Group initial SAM masks into depth layers by 1D k-means, or only sort them.",
+        default="sort",
+        help="Sort initial masks by depth. The kmeans option is kept only for ablation.",
     )
     parser.add_argument(
         "--depth_num_layers",
