@@ -31,8 +31,6 @@ train:
   is_train_struct_color: True
   struct_opt_num_iters: 50
   visual_opt_num_iters: 100
-  disable_exclude_loss: True
-  single_render_struct_loss: True
 
 base_lr:
   point: 1
