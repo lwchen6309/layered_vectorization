@@ -312,6 +312,15 @@ def get_layer_shape_ranges(layerd_struct_masks: list) -> list:
     return ranges
 
 
+def combine_binary_masks(masks: list) -> np.ndarray:
+    if not masks:
+        raise ValueError("Cannot combine an empty mask list.")
+    combined = np.zeros_like(masks[0], dtype=np.uint8)
+    for mask in masks:
+        combined = np.maximum(combined, np.where(mask > 0, 255, 0).astype(np.uint8))
+    return combined
+
+
 def svg_optimize_img_struct(
     device,
     shapes,
@@ -567,6 +576,111 @@ def svg_optimize_img_visual(
     return shapes, shape_groups, count
 
 
+def add_visual_paths_in_depth_layer(
+    shapes,
+    shape_groups,
+    device,
+    target_img: np.ndarray,
+    allowed_mask: np.ndarray,
+    insert_index: int,
+    epsilon: int = 5,
+    N: int = 50,
+):
+    img_height, img_width = target_img.shape[:2]
+    visible_shapes = shapes[:insert_index]
+    visible_shape_groups = shape_groups[:insert_index]
+    raster_img = svg_to_img(img_width, img_height, visible_shapes, visible_shape_groups, device)
+    raster_img = rgba_to_rgb(raster_img, device=device)
+    raster_img = raster_img.detach().cpu().numpy()
+    target_img1 = np.transpose((target_img / 255).astype(np.float16), (2, 0, 1))
+
+    candidate_masks = select_mask_by_conn_area(raster_img, target_img1, N)
+    if len(candidate_masks) == 0:
+        return shapes, shape_groups, []
+
+    allowed_mask = allowed_mask > 0
+    new_indices = []
+    for mask in candidate_masks:
+        mask = np.logical_and(mask > 0, allowed_mask).astype(np.uint8) * 255
+        if int(np.sum(mask > 0)) <= 0:
+            continue
+
+        color = get_mean_color(target_img, mask)
+        path_group = pydiffvg.ShapeGroup(
+            shape_ids=torch.LongTensor([0]),
+            fill_color=torch.FloatTensor(list(color) + [255]) / 255,
+            stroke_color=torch.FloatTensor([0, 0, 0, 1]),
+        )
+        mask = connect_mask_interior_exterior(mask)
+        path = init_path_by_mask(mask, epsilon)
+
+        shapes.insert(insert_index, path)
+        shape_groups.insert(insert_index, path_group)
+        new_indices.append(insert_index)
+        insert_index += 1
+
+    for index, shape_group in enumerate(shape_groups):
+        shape_group.shape_ids = torch.LongTensor([index])
+    return shapes, shape_groups, new_indices
+
+
+def svg_optimize_img_visual_prefix(
+    device,
+    shapes,
+    shape_groups,
+    target_img: np.ndarray,
+    file_save_path: str,
+    active_indices: List[int],
+    visible_end: int,
+    train_conf: dict,
+    base_lr_conf: dict,
+    count: int = 0,
+):
+    img_height, img_width = target_img.shape[:2]
+    target_img = torch.tensor(target_img, device=device) / 255.0
+    target_img = target_img.permute(2, 0, 1)
+
+    active_set = set(active_indices)
+    is_opt_list = [1 if index in active_set else 0 for index in range(len(shapes))]
+    svg_optimizer = init_optimizer(
+        shapes,
+        shape_groups,
+        train_conf["is_train_stroke"],
+        train_conf["is_train_visual_color"],
+        is_opt_list,
+        lr_base=base_lr_conf,
+    )
+
+    num_iters = train_conf["visual_opt_num_iters"]
+    with tqdm(total=num_iters, desc="Visual depth layer", unit="iter") as pbar:
+        for _ in range(num_iters):
+            img = svg_to_img(
+                img_width,
+                img_height,
+                shapes[:visible_end],
+                shape_groups[:visible_end],
+                device,
+            )
+            img = rgba_to_rgb(img, device)
+            loss = F.mse_loss(img, target_img)
+
+            svg_optimizer.zero_grad()
+            loss.backward()
+            svg_optimizer.step()
+
+            pydiffvg.save_svg(
+                os.path.join(file_save_path, f"{count}.svg"),
+                img_width,
+                img_height,
+                shapes,
+                shape_groups,
+            )
+            count += 1
+            pbar.update(1)
+
+    return shapes, shape_groups, count
+
+
 def layered_vectorization(
     args,
     device=None,
@@ -695,93 +809,157 @@ def layered_vectorization(
         )
 
     print("Visual Refinement...")
-    pseudo_struct_masks = [mask for sublist in layerd_struct_masks for mask in sublist]
-    is_opt_list = []
     count = 0
-    struct_path_num = len(shapes)
+    if args.train.get("depth_layer_visual_refinement", False) and depth_map is not None:
+        layer_ranges = get_layer_shape_ranges(layerd_struct_masks)
+        layer_masks = [combine_binary_masks(masks) for masks in layerd_struct_masks]
 
-    for i in range(args.add_visual_path_num_iters):
-        add_dir = os.path.join(visual_svgs_save_path, f"{i}_add_paths")
-        os.makedirs(add_dir, exist_ok=True)
+        for i in range(args.add_visual_path_num_iters):
+            any_added = False
+            for layer_index, allowed_mask in enumerate(layer_masks):
+                remaining_path_num = args.max_path_num_limit - len(shapes)
+                if remaining_path_num <= 0:
+                    break
 
-        if i == args.add_visual_path_num_iters - 1:
-            remaining_path_num = args.max_path_num_limit - len(shapes)
-        else:
-            remaining_path_num = int((args.max_path_num_limit - len(shapes)) * 0.6)
+                remaining_slots = max(
+                    1,
+                    (args.add_visual_path_num_iters - i) * (len(layer_masks) - layer_index),
+                )
+                add_num = max(1, int(np.ceil(remaining_path_num / remaining_slots)))
+                start, end = layer_ranges[layer_index]
+                add_dir = os.path.join(
+                    visual_svgs_save_path,
+                    f"{i}_depth_layer_{layer_index}_add_paths",
+                )
+                os.makedirs(add_dir, exist_ok=True)
 
-        shapes, shape_groups, pseudo_struct_masks, is_opt_list, struct_path_num = add_visual_paths(
-            shapes,
-            shape_groups,
-            device,
-            struct_path_num,
-            target_img_cluster,
-            pseudo_struct_masks,
-            is_opt_list,
-            epsilon=args.approxpolydp_epsilon,
-            N=remaining_path_num,
-        )
+                shapes, shape_groups, new_indices = add_visual_paths_in_depth_layer(
+                    shapes,
+                    shape_groups,
+                    device,
+                    target_img_cluster,
+                    allowed_mask,
+                    insert_index=end,
+                    epsilon=args.approxpolydp_epsilon,
+                    N=add_num,
+                )
+                if not new_indices:
+                    continue
 
-        if struct_path_num == -1:
-            print("There are no new paths to add.")
-            break
+                any_added = True
+                added_count = len(new_indices)
+                layer_ranges[layer_index] = (start, end + added_count)
+                for later_index in range(layer_index + 1, len(layer_ranges)):
+                    later_start, later_end = layer_ranges[later_index]
+                    layer_ranges[later_index] = (
+                        later_start + added_count,
+                        later_end + added_count,
+                    )
 
-        print("Add new path")
-        shapes, shape_groups, count = svg_optimize_img_visual(
-            device,
-            shapes,
-            shape_groups,
-            target_img,
-            add_dir,
-            is_opt_list,
-            args.train,
-            args.base_lr,
-            count,
-            struct_path_num,
-        )
+                _, visible_end = layer_ranges[layer_index]
+                shapes, shape_groups, count = svg_optimize_img_visual_prefix(
+                    device,
+                    shapes,
+                    shape_groups,
+                    target_img,
+                    add_dir,
+                    new_indices,
+                    visible_end,
+                    args.train,
+                    args.base_lr,
+                    count,
+                )
 
-        if i == args.add_visual_path_num_iters - 1:
-            break
+            if not any_added:
+                print("There are no new depth-layer visual paths to add.")
+                break
+    else:
+        pseudo_struct_masks = [mask for sublist in layerd_struct_masks for mask in sublist]
+        is_opt_list = []
+        struct_path_num = len(shapes)
 
-        shapes, shape_groups = remove_lowquality_paths(
-            shapes,
-            shape_groups,
-            device,
-            img_width,
-            img_height,
-            visual_difference_threshold=args.paths_remove_visual_threshold,
-            struct_path_num=struct_path_num,
-        )
+        for i in range(args.add_visual_path_num_iters):
+            add_dir = os.path.join(visual_svgs_save_path, f"{i}_add_paths")
+            os.makedirs(add_dir, exist_ok=True)
 
-        print("Path merging")
-        merge_dir = os.path.join(visual_svgs_save_path, f"{i}_merge_paths")
-        os.makedirs(merge_dir, exist_ok=True)
+            if i == args.add_visual_path_num_iters - 1:
+                remaining_path_num = args.max_path_num_limit - len(shapes)
+            else:
+                remaining_path_num = int((args.max_path_num_limit - len(shapes)) * 0.6)
 
-        shapes, shape_groups, pseudo_struct_masks, is_opt_list, struct_path_num = merge_path(
-            shapes,
-            shape_groups,
-            device,
-            img_width,
-            img_height,
-            struct_path_num,
-            pseudo_struct_masks,
-            is_opt_list,
-            color_threshold=args.paths_merge_color_threshold,
-            overlapping_area_threshold=args.paths_merge_distance_threshold,
-        )
+            shapes, shape_groups, pseudo_struct_masks, is_opt_list, struct_path_num = add_visual_paths(
+                shapes,
+                shape_groups,
+                device,
+                struct_path_num,
+                target_img_cluster,
+                pseudo_struct_masks,
+                is_opt_list,
+                epsilon=args.approxpolydp_epsilon,
+                N=remaining_path_num,
+            )
 
-        shapes, shape_groups, count = svg_optimize_img_visual(
-            device,
-            shapes,
-            shape_groups,
-            target_img,
-            merge_dir,
-            is_opt_list,
-            args.train,
-            args.base_lr,
-            count,
-            struct_path_num,
-            is_path_merging_phase=True,
-        )
+            if struct_path_num == -1:
+                print("There are no new paths to add.")
+                break
+
+            print("Add new path")
+            shapes, shape_groups, count = svg_optimize_img_visual(
+                device,
+                shapes,
+                shape_groups,
+                target_img,
+                add_dir,
+                is_opt_list,
+                args.train,
+                args.base_lr,
+                count,
+                struct_path_num,
+            )
+
+            if i == args.add_visual_path_num_iters - 1:
+                break
+
+            shapes, shape_groups = remove_lowquality_paths(
+                shapes,
+                shape_groups,
+                device,
+                img_width,
+                img_height,
+                visual_difference_threshold=args.paths_remove_visual_threshold,
+                struct_path_num=struct_path_num,
+            )
+
+            print("Path merging")
+            merge_dir = os.path.join(visual_svgs_save_path, f"{i}_merge_paths")
+            os.makedirs(merge_dir, exist_ok=True)
+
+            shapes, shape_groups, pseudo_struct_masks, is_opt_list, struct_path_num = merge_path(
+                shapes,
+                shape_groups,
+                device,
+                img_width,
+                img_height,
+                struct_path_num,
+                pseudo_struct_masks,
+                is_opt_list,
+                color_threshold=args.paths_merge_color_threshold,
+                overlapping_area_threshold=args.paths_merge_distance_threshold,
+            )
+
+            shapes, shape_groups, count = svg_optimize_img_visual(
+                device,
+                shapes,
+                shape_groups,
+                target_img,
+                merge_dir,
+                is_opt_list,
+                args.train,
+                args.base_lr,
+                count,
+                struct_path_num,
+                is_path_merging_phase=True,
+            )
 
     if depth_map is not None and getattr(args, "depth_sort_final_svg", True):
         pydiffvg.save_svg(

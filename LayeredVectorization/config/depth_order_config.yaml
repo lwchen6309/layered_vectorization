@@ -32,6 +32,7 @@ train:
   is_train_struct_color: True
   depth_layer_sequential_fit: True
   depth_layer_struct_num_iters: 50
+  depth_layer_visual_refinement: True
   struct_opt_num_iters: 50
   visual_opt_num_iters: 100
 
