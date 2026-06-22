@@ -6,6 +6,8 @@ approxpolydp_epsilon: 5
 color_fitting_type: "dominan"
 add_visual_path_num_iters: 5
 max_path_num_limit: 256
+depth_layer_grouping: "kmeans"
+depth_num_layers: 3
 
 paths_merge_color_threshold: 0.1
 paths_merge_distance_threshold: 3

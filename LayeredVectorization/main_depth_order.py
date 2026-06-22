@@ -204,6 +204,100 @@ def sort_layered_masks_back_to_front_by_depth(
     return sorted_layers, order_meta
 
 
+def _kmeans_1d(values: np.ndarray, k: int, num_iters: int = 50) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float32)
+    if len(values) == 0:
+        return np.asarray([], dtype=np.int64)
+
+    k = max(1, min(k, len(values)))
+    centers = np.quantile(values, np.linspace(0.0, 1.0, k)).astype(np.float32)
+    labels = np.zeros(len(values), dtype=np.int64)
+
+    for _ in range(num_iters):
+        distances = np.abs(values[:, None] - centers[None, :])
+        next_labels = np.argmin(distances, axis=1)
+        next_centers = centers.copy()
+        for label in range(k):
+            assigned = values[next_labels == label]
+            if len(assigned) > 0:
+                next_centers[label] = float(np.mean(assigned))
+
+        if np.array_equal(next_labels, labels) and np.allclose(next_centers, centers):
+            break
+        labels = next_labels
+        centers = next_centers
+
+    center_order = np.argsort(centers)
+    remap = {int(old_label): int(new_label) for new_label, old_label in enumerate(center_order)}
+    return np.asarray([remap[int(label)] for label in labels], dtype=np.int64)
+
+
+def kmeans_layered_masks_by_depth(
+    layerd_struct_masks: list,
+    depth_map: np.ndarray,
+    near_mode: str = "large",
+    num_depth_layers: int = 3,
+):
+    records = []
+    for layer_index, layer in enumerate(layerd_struct_masks):
+        for mask_index, mask in enumerate(layer):
+            seg = mask > 0
+            if np.any(seg):
+                raw_depth = float(np.median(depth_map[seg]))
+            else:
+                raw_depth = 0.0
+            depth_score = raw_depth if near_mode == "large" else (1.0 - raw_depth)
+            records.append(
+                {
+                    "old_layer": layer_index,
+                    "old_index": mask_index,
+                    "raw_depth": raw_depth,
+                    "depth_score": depth_score,
+                    "area": int(np.sum(seg)),
+                    "mask": mask,
+                }
+            )
+
+    if not records:
+        return layerd_struct_masks, []
+
+    labels = _kmeans_1d(
+        np.asarray([record["depth_score"] for record in records], dtype=np.float32),
+        k=num_depth_layers,
+    )
+    layer_count = int(labels.max()) + 1
+    sorted_layers = [[] for _ in range(layer_count)]
+    order_meta = []
+
+    for record, label in sorted(zip(records, labels), key=lambda item: (int(item[1]), item[0]["depth_score"], -item[0]["area"])):
+        layer_index = int(label)
+        sorted_layers[layer_index].append(record["mask"])
+        order_meta.append(
+            {
+                "new_layer": layer_index,
+                "old_layer": record["old_layer"],
+                "old_index": record["old_index"],
+                "raw_depth": record["raw_depth"],
+                "depth_score": record["depth_score"],
+                "area": record["area"],
+            }
+        )
+
+    sorted_layers = [layer for layer in sorted_layers if layer]
+    return sorted_layers, order_meta
+
+
+def save_depth_layer_masks(layerd_struct_masks: list, out_dir: str) -> None:
+    os.makedirs(out_dir, exist_ok=True)
+    for layer_index, masks in enumerate(layerd_struct_masks):
+        if not masks:
+            continue
+        combined = np.zeros_like(masks[0], dtype=np.uint8)
+        for mask in masks:
+            combined = np.maximum(combined, np.where(mask > 0, 255, 0).astype(np.uint8))
+        Image.fromarray(combined).save(os.path.join(out_dir, f"depth_layer_{layer_index:02d}.png"))
+
+
 def svg_optimize_img_struct(
     device,
     shapes,
@@ -428,10 +522,23 @@ def layered_vectorization(
             exp_dir,
         )
         layerd_struct_masks = sanitize_layered_masks(layerd_struct_masks)
-        layerd_struct_masks, initial_depth_order = sort_layered_masks_back_to_front_by_depth(
+        depth_layer_grouping = getattr(args, "depth_layer_grouping", "kmeans")
+        if depth_layer_grouping == "kmeans":
+            layerd_struct_masks, initial_depth_order = kmeans_layered_masks_by_depth(
+                layerd_struct_masks,
+                depth_map,
+                near_mode=getattr(args, "depth_near_mode", "large"),
+                num_depth_layers=int(getattr(args, "depth_num_layers", 3)),
+            )
+        else:
+            layerd_struct_masks, initial_depth_order = sort_layered_masks_back_to_front_by_depth(
+                layerd_struct_masks,
+                depth_map,
+                near_mode=getattr(args, "depth_near_mode", "large"),
+            )
+        save_depth_layer_masks(
             layerd_struct_masks,
-            depth_map,
-            near_mode=getattr(args, "depth_near_mode", "large"),
+            os.path.join(exp_dir, "depth_ordering", f"{depth_layer_grouping}_layer_masks"),
         )
         with open(os.path.join(exp_dir, "initial_depth_mask_order.json"), "w", encoding="utf-8") as f:
             json.dump(initial_depth_order, f, indent=2)
@@ -681,6 +788,18 @@ if __name__ == "__main__":
         choices=["large", "small"],
         default="large",
         help="Interpret larger depth values as nearer (default) or smaller as nearer.",
+    )
+    parser.add_argument(
+        "--depth_layer_grouping",
+        choices=["kmeans", "sort"],
+        default="kmeans",
+        help="Group initial SAM masks into depth layers by 1D k-means, or only sort them.",
+    )
+    parser.add_argument(
+        "--depth_num_layers",
+        type=int,
+        default=3,
+        help="Number of depth layers for k-means grouping, ordered far to near.",
     )
 
     args = parser.parse_args()
