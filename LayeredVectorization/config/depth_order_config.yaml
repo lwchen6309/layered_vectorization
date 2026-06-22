@@ -6,7 +6,8 @@ approxpolydp_epsilon: 5
 color_fitting_type: "dominan"
 add_visual_path_num_iters: 5
 max_path_num_limit: 256
-depth_layer_grouping: "sort"
+depth_layer_grouping: "pixel_cluster"
+depth_num_layers: 3
 depth_sort_final_svg: False
 
 paths_merge_color_threshold: 0.1

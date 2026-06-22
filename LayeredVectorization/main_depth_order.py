@@ -301,6 +301,62 @@ def kmeans_layered_masks_by_depth(
     return sorted_layers, order_meta
 
 
+def pixel_depth_cluster_layers(
+    layerd_struct_masks: list,
+    depth_map: np.ndarray,
+    near_mode: str = "large",
+    num_depth_layers: int = 3,
+):
+    """Partition all pixels by depth, then clip SAM masks into those layers."""
+    depth_score = depth_map if near_mode == "large" else (1.0 - depth_map)
+    labels = _kmeans_1d(depth_score.reshape(-1), k=num_depth_layers).reshape(depth_map.shape)
+    layer_count = int(labels.max()) + 1
+    depth_layers = [(labels == layer_index).astype(np.uint8) * 255 for layer_index in range(layer_count)]
+
+    sorted_layers = [[depth_layer] for depth_layer in depth_layers]
+    order_meta = [
+        {
+            "new_layer": layer_index,
+            "old_layer": None,
+            "old_index": None,
+            "raw_depth": None,
+            "depth_score": None,
+            "area": int(np.sum(depth_layer > 0)),
+            "source": "pixel_depth_cluster_base",
+        }
+        for layer_index, depth_layer in enumerate(depth_layers)
+    ]
+    flat_masks = []
+    for old_layer, masks in enumerate(layerd_struct_masks):
+        for old_index, mask in enumerate(masks):
+            flat_masks.append((old_layer, old_index, mask))
+
+    for old_layer, old_index, mask in flat_masks:
+        mask_bool = mask > 0
+        if not np.any(mask_bool):
+            continue
+        raw_depth = float(np.median(depth_map[mask_bool]))
+        mask_depth_score = raw_depth if near_mode == "large" else (1.0 - raw_depth)
+        for layer_index, depth_layer in enumerate(depth_layers):
+            clipped = np.logical_and(mask_bool, depth_layer > 0).astype(np.uint8) * 255
+            area = int(np.sum(clipped > 0))
+            if area <= 0:
+                continue
+            sorted_layers[layer_index].append(np.ascontiguousarray(clipped))
+            order_meta.append(
+                {
+                    "new_layer": layer_index,
+                    "old_layer": old_layer,
+                    "old_index": old_index,
+                    "raw_depth": raw_depth,
+                    "depth_score": mask_depth_score,
+                    "area": area,
+                    "source": "sam_mask_clipped_to_pixel_depth_cluster",
+                }
+            )
+    return sorted_layers, order_meta
+
+
 def save_depth_layer_masks(layerd_struct_masks: list, out_dir: str) -> None:
     os.makedirs(out_dir, exist_ok=True)
     for layer_index, masks in enumerate(layerd_struct_masks):
@@ -777,7 +833,14 @@ def layered_vectorization(
         )
         layerd_struct_masks = sanitize_layered_masks(layerd_struct_masks)
         depth_layer_grouping = getattr(args, "depth_layer_grouping", "kmeans")
-        if depth_layer_grouping == "kmeans":
+        if depth_layer_grouping == "pixel_cluster":
+            layerd_struct_masks, initial_depth_order = pixel_depth_cluster_layers(
+                layerd_struct_masks,
+                depth_map,
+                near_mode=getattr(args, "depth_near_mode", "large"),
+                num_depth_layers=int(getattr(args, "depth_num_layers", 3)),
+            )
+        elif depth_layer_grouping == "kmeans":
             layerd_struct_masks, initial_depth_order = kmeans_layered_masks_by_depth(
                 layerd_struct_masks,
                 depth_map,
@@ -1132,9 +1195,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--depth_layer_grouping",
-        choices=["kmeans", "sort"],
-        default="sort",
-        help="Sort initial masks by depth. The kmeans option is kept only for ablation.",
+        choices=["pixel_cluster", "kmeans", "sort"],
+        default="pixel_cluster",
+        help="Build depth layers from pixel-depth clusters, then assign SAM masks to those layers.",
     )
     parser.add_argument(
         "--depth_num_layers",
