@@ -99,6 +99,16 @@ def exclude_loss(raster_img, scale=1):
     return loss
 
 
+def mask_to_torch(mask: np.ndarray, device) -> torch.Tensor:
+    mask = np.where(mask > 0, 1.0, 0.0).astype(np.float32)
+    return torch.tensor(mask, device=device).unsqueeze(0)
+
+
+def masked_mse_loss(img: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    denom = torch.clamp(mask.sum() * img.shape[0], min=1.0)
+    return torch.sum((img - target) ** 2 * mask) / denom
+
+
 def _path_depth_score(path, depth_map: np.ndarray, near_mode: str = "large") -> float:
     points = path.points.detach().float().cpu().numpy()
     if points.size == 0:
@@ -362,12 +372,16 @@ def svg_optimize_img_struct(
     target_img = torch.tensor(target_img, device=device) / 255.0
     target_img = target_img.permute(2, 0, 1)
 
-    if train_conf.get("depth_layer_sequential_fit", False):
+    if train_conf.get("three_pass_depth_layervec", train_conf.get("depth_layer_sequential_fit", False)):
         layer_ranges = get_layer_shape_ranges(layerd_struct_masks)
+        layer_masks = [mask_to_torch(combine_binary_masks(masks), device) for masks in layerd_struct_masks]
         layer_num_iters = int(
             train_conf.get(
-                "depth_layer_struct_num_iters",
-                train_conf["struct_opt_num_iters"],
+                "three_pass_struct_num_iters",
+                train_conf.get(
+                    "depth_layer_struct_num_iters",
+                    train_conf["struct_opt_num_iters"],
+                ),
             )
         )
         global_iter = 0
@@ -389,9 +403,10 @@ def svg_optimize_img_struct(
             )
 
             cur_masks = layerd_struct_masks[struct_i]
+            layer_mask = layer_masks[struct_i]
             with tqdm(
                 total=layer_num_iters,
-                desc=f"Struct depth layer {struct_i}",
+                desc=f"LayerVec pass {struct_i}",
                 unit="iter",
             ) as pbar:
                 for _ in range(layer_num_iters):
@@ -405,7 +420,7 @@ def svg_optimize_img_struct(
                         device,
                     )
                     img = rgba_to_rgb(img, device, white_bg)
-                    loss_mse = F.mse_loss(img, target_img)
+                    loss_mse = masked_mse_loss(img, target_img, layer_mask)
 
                     struct_img = svg_to_img(
                         img_width,
@@ -632,6 +647,7 @@ def svg_optimize_img_visual_prefix(
     file_save_path: str,
     active_indices: List[int],
     visible_end: int,
+    loss_mask: np.ndarray,
     train_conf: dict,
     base_lr_conf: dict,
     count: int = 0,
@@ -639,6 +655,7 @@ def svg_optimize_img_visual_prefix(
     img_height, img_width = target_img.shape[:2]
     target_img = torch.tensor(target_img, device=device) / 255.0
     target_img = target_img.permute(2, 0, 1)
+    loss_mask = mask_to_torch(loss_mask, device)
 
     active_set = set(active_indices)
     is_opt_list = [1 if index in active_set else 0 for index in range(len(shapes))]
@@ -652,7 +669,7 @@ def svg_optimize_img_visual_prefix(
     )
 
     num_iters = train_conf["visual_opt_num_iters"]
-    with tqdm(total=num_iters, desc="Visual depth layer", unit="iter") as pbar:
+    with tqdm(total=num_iters, desc="Visual LayerVec pass", unit="iter") as pbar:
         for _ in range(num_iters):
             img = svg_to_img(
                 img_width,
@@ -662,7 +679,7 @@ def svg_optimize_img_visual_prefix(
                 device,
             )
             img = rgba_to_rgb(img, device)
-            loss = F.mse_loss(img, target_img)
+            loss = masked_mse_loss(img, target_img, loss_mask)
 
             svg_optimizer.zero_grad()
             loss.backward()
@@ -810,7 +827,7 @@ def layered_vectorization(
 
     print("Visual Refinement...")
     count = 0
-    if args.train.get("depth_layer_visual_refinement", False) and depth_map is not None:
+    if args.train.get("three_pass_visual_refinement", args.train.get("depth_layer_visual_refinement", False)) and depth_map is not None:
         layer_ranges = get_layer_shape_ranges(layerd_struct_masks)
         layer_masks = [combine_binary_masks(masks) for masks in layerd_struct_masks]
 
@@ -829,7 +846,7 @@ def layered_vectorization(
                 start, end = layer_ranges[layer_index]
                 add_dir = os.path.join(
                     visual_svgs_save_path,
-                    f"{i}_depth_layer_{layer_index}_add_paths",
+                    f"{i}_layervec_pass_{layer_index}_add_paths",
                 )
                 os.makedirs(add_dir, exist_ok=True)
 
@@ -865,6 +882,7 @@ def layered_vectorization(
                     add_dir,
                     new_indices,
                     visible_end,
+                    allowed_mask,
                     args.train,
                     args.base_lr,
                     count,
@@ -961,7 +979,11 @@ def layered_vectorization(
                 is_path_merging_phase=True,
             )
 
-    if depth_map is not None and getattr(args, "depth_sort_final_svg", True):
+    uses_three_pass_depth_layervec = args.train.get(
+        "three_pass_depth_layervec",
+        args.train.get("depth_layer_sequential_fit", False),
+    )
+    if depth_map is not None and getattr(args, "depth_sort_final_svg", True) and not uses_three_pass_depth_layervec:
         pydiffvg.save_svg(
             os.path.join(exp_dir, "final_before_depth_sort.svg"),
             img_width,

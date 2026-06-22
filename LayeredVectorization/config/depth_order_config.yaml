@@ -7,6 +7,7 @@ color_fitting_type: "dominan"
 add_visual_path_num_iters: 5
 max_path_num_limit: 256
 depth_layer_grouping: "sort"
+depth_sort_final_svg: False
 
 paths_merge_color_threshold: 0.1
 paths_merge_distance_threshold: 3
@@ -30,9 +31,9 @@ train:
   is_train_stroke: False
   is_train_visual_color: True
   is_train_struct_color: True
-  depth_layer_sequential_fit: True
-  depth_layer_struct_num_iters: 50
-  depth_layer_visual_refinement: True
+  three_pass_depth_layervec: True
+  three_pass_struct_num_iters: 50
+  three_pass_visual_refinement: True
   struct_opt_num_iters: 50
   visual_opt_num_iters: 100
 
