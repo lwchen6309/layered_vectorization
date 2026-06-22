@@ -154,6 +154,56 @@ def sanitize_layered_masks(layerd_struct_masks: list) -> list:
     return sanitized
 
 
+def sort_layered_masks_back_to_front_by_depth(
+    layerd_struct_masks: list,
+    depth_map: np.ndarray,
+    near_mode: str = "large",
+):
+    flat_masks = []
+    for layer_index, layer in enumerate(layerd_struct_masks):
+        for mask_index, mask in enumerate(layer):
+            seg = mask > 0
+            if np.any(seg):
+                raw_depth = float(np.median(depth_map[seg]))
+            else:
+                raw_depth = 0.0
+            depth_score = raw_depth if near_mode == "large" else (1.0 - raw_depth)
+            flat_masks.append(
+                {
+                    "old_layer": layer_index,
+                    "old_index": mask_index,
+                    "depth_score": depth_score,
+                    "area": int(np.sum(seg)),
+                    "mask": mask,
+                }
+            )
+
+    if not flat_masks:
+        return layerd_struct_masks, []
+
+    flat_masks.sort(key=lambda item: (item["depth_score"], -item["area"]))
+    layer_count = max(1, len(layerd_struct_masks))
+    sorted_layers = [[] for _ in range(layer_count)]
+    order_meta = []
+
+    for rank, item in enumerate(flat_masks):
+        layer_index = min(layer_count - 1, rank * layer_count // len(flat_masks))
+        sorted_layers[layer_index].append(item["mask"])
+        order_meta.append(
+            {
+                "new_rank": rank,
+                "new_layer": layer_index,
+                "old_layer": item["old_layer"],
+                "old_index": item["old_index"],
+                "depth_score": item["depth_score"],
+                "area": item["area"],
+            }
+        )
+
+    sorted_layers = [layer for layer in sorted_layers if layer]
+    return sorted_layers, order_meta
+
+
 def svg_optimize_img_struct(
     device,
     shapes,
@@ -378,6 +428,13 @@ def layered_vectorization(
             exp_dir,
         )
         layerd_struct_masks = sanitize_layered_masks(layerd_struct_masks)
+        layerd_struct_masks, initial_depth_order = sort_layered_masks_back_to_front_by_depth(
+            layerd_struct_masks,
+            depth_map,
+            near_mode=getattr(args, "depth_near_mode", "large"),
+        )
+        with open(os.path.join(exp_dir, "initial_depth_mask_order.json"), "w", encoding="utf-8") as f:
+            json.dump(initial_depth_order, f, indent=2)
     else:
         print("SAM...")
         masks = sam_img_seq(device, simp_img_seq, masks_save_path, args.sam)
