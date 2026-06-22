@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 import pydiffvg
 import numpy as np
+import cv2
 
 from PIL import Image
 from tqdm import tqdm
@@ -355,6 +356,25 @@ def pixel_depth_cluster_layers(
                     "source": "sam_mask_clipped_to_pixel_depth_cluster",
                 }
             )
+    for layer_index, depth_layer in enumerate(depth_layers):
+        if path_layers[layer_index]:
+            geometry_union = combine_binary_masks(path_layers[layer_index])
+        else:
+            geometry_union = np.zeros_like(depth_layer, dtype=np.uint8)
+        residual = np.logical_and(depth_layer > 0, geometry_union == 0).astype(np.uint8) * 255
+        for component in split_binary_mask_components(residual):
+            path_layers[layer_index].append(component)
+            order_meta.append(
+                {
+                    "new_layer": layer_index,
+                    "old_layer": None,
+                    "old_index": None,
+                    "raw_depth": None,
+                    "depth_score": None,
+                    "area": int(np.sum(component > 0)),
+                    "source": "owner_residual_fallback",
+                }
+            )
     for layer_index, masks in enumerate(path_layers):
         if masks:
             continue
@@ -401,6 +421,19 @@ def combine_binary_masks(masks: list) -> np.ndarray:
     for mask in masks:
         combined = np.maximum(combined, np.where(mask > 0, 255, 0).astype(np.uint8))
     return combined
+
+
+def split_binary_mask_components(mask: np.ndarray, min_area: int = 16) -> list:
+    mask = np.where(mask > 0, 255, 0).astype(np.uint8)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    components = []
+    for label in range(1, num_labels):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area < min_area:
+            continue
+        component = np.where(labels == label, 255, 0).astype(np.uint8)
+        components.append(np.ascontiguousarray(component))
+    return components
 
 
 def ensure_depth_layers_cover_canvas(layerd_struct_masks: list, out_dir: str):
