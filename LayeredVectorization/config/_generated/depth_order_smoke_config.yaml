@@ -1,0 +1,43 @@
+simp_img_seq_indexs: [0]
+is_save_all_simp_img_seq: False
+is_save_masks: True
+multiple: 1
+approxpolydp_epsilon: 5
+color_fitting_type: "dominan"
+add_visual_path_num_iters: 0
+max_path_num_limit: 24
+
+paths_merge_color_threshold: 0.1
+paths_merge_distance_threshold: 3
+paths_remove_visual_threshold: 7.0
+
+is_cluster_target_img: True
+kmeas_k: 24
+
+sam:
+  sam_checkpoint: "sam_vit_h_4b8939.pth"
+  model_type: "vit_h"
+  points_per_side: 12
+  pred_iou_thresh: 0.86
+  stability_score_thresh: 0.85
+  crop_n_layers: 0
+  crop_n_points_downscale_factor: 2
+  min_mask_region_area: 80
+  box_nms_thresh: 0.7
+  depth_min_area_frac: 0.002
+  depth_max_area_frac: 0.6
+  depth_max_masks: 18
+  depth_mask_nms_iou: 0.65
+
+train:
+  is_train_stroke: False
+  is_train_visual_color: True
+  is_train_struct_color: True
+  struct_opt_num_iters: 0
+  visual_opt_num_iters: 0
+
+base_lr:
+  point: 1
+  color: 0.01
+  stroke_width: 0.1
+  stroke_color: 0.01
